@@ -1,0 +1,178 @@
+kind: List
+apiVersion: v1
+metadata:
+  name: amq-broker-7-image-streams
+  annotations:
+    description: ImageStream definitions for Red Hat AMQ Broker 7.5 Container Image
+    openshift.io/provider-display-name: Red Hat, Inc.
+items:
+- kind: ImageStream
+  apiVersion: image.openshift.io/v1
+  metadata:
+    name: amq-broker
+    annotations:
+      openshift.io/display-name: Red Hat AMQ Broker 7.5
+      openshift.io/provider-display-name: Red Hat, Inc.
+  spec:
+    lookupPolicy:
+      local: true  
+    tags:
+    - name: '7.5'
+      annotations:
+        description: Red Hat AMQ Broker 7.5.0 image.
+        iconClass: icon-jboss
+        tags: messaging,amq,jboss,xpaas
+        supports: amq:7.5,messaging:7.5
+        version: '7.5'
+      from:
+        kind: DockerImage
+        name: registry.redhat.io/amq7/amq-broker:7.5
+- kind: Service
+  apiVersion: v1
+  spec:
+    ports:
+    - port: 5672
+      targetPort: 5672
+    selector:
+      deploymentConfig: "work-queue-broker-amq"
+  metadata:
+    name: "work-queue-broker-amq-amqp"
+    labels:
+      application: "work-queue-broker"
+    annotations:
+      description: The broker's AMQP port.
+- kind: Service
+  apiVersion: v1
+  spec:
+    ports:
+    - port: 1883
+      targetPort: 1883
+    selector:
+      deploymentConfig: "work-queue-broker-amq"
+  metadata:
+    name: "work-queue-broker-amq-mqtt"
+    labels:
+      application: "work-queue-broker"
+    annotations:
+      description: The broker's MQTT port.
+- kind: Service
+  apiVersion: v1
+  spec:
+    ports:
+    - port: 61613
+      targetPort: 61613
+    selector:
+      deploymentConfig: "work-queue-broker-amq"
+  metadata:
+    name: "work-queue-broker-amq-stomp"
+    labels:
+      application: "work-queue-broker"
+    annotations:
+      description: The broker's STOMP port.
+- kind: Service
+  apiVersion: v1
+  spec:
+    ports:
+    - port: 61616
+      targetPort: 61616
+    selector:
+      deploymentConfig: "work-queue-broker-amq"
+  metadata:
+    name: "work-queue-broker-amq-tcp"
+    labels:
+      application: "work-queue-broker"
+    annotations:
+      description: The broker's OpenWire port.
+      service.alpha.openshift.io/dependencies: '[{"name": "work-queue-broker-amq-amqp",
+        "kind": "Service"},{"name": "work-queue-broker-amq-mqtt", "kind": "Service"},{"name":
+        "work-queue-broker-amq-stomp", "kind": "Service"}]'
+- kind: Service
+  apiVersion: v1
+  spec:
+    clusterIP: None
+    ports:
+    - name: mesh
+      port: 61616
+    selector:
+      deploymentConfig: "work-queue-broker-amq"
+  metadata:
+    name: "work-queue-broker-amq-mesh"
+    labels:
+      application: "work-queue-broker"
+    annotations:
+      service.alpha.kubernetes.io/tolerate-unready-endpoints: 'true'
+      description: Supports node discovery for mesh formation.
+- apiVersion: apps.openshift.io/v1
+  kind: DeploymentConfig
+  metadata:
+    labels:
+      application: work-queue-broker
+    name: "work-queue-broker-amq"
+  spec:
+    replicas: 1
+    selector:
+      deploymentConfig: "work-queue-broker-amq"
+    strategy:
+      rollingParams:
+        maxSurge: 0
+      type: Rolling
+    template:
+      metadata:
+        labels:
+          application: work-queue-broker
+          deploymentConfig: "work-queue-broker-amq"
+        name: "work-queue-broker-amq"
+      spec:
+        containers:
+        - env:
+          - name: AMQ_USER
+            value: "work-queue"
+          - name: AMQ_PASSWORD
+            value: "work-queue"
+          - name: AMQ_ROLE
+            value: "admin"
+          - name: AMQ_NAME
+            value: "amq-broker"
+          - name: AMQ_TRANSPORTS
+            value: "amqp,mqtt,stomp"
+          - name: AMQ_QUEUES
+            value: "work-queue/requests,work-queue/responses"
+          - name: AMQ_ADDRESSES
+            value: "work-queue/worker-updates"
+          - name: AMQ_REQUIRE_LOGIN
+            value: "false"
+          - name: AMQ_EXTRA_ARGS
+            value: "--no-autotune"
+          - name: AMQ_ENABLE_METRICS_PLUGIN
+            value: "false"
+          - name: AMQ_JOURNAL_TYPE
+            value: "nio"
+          image: "registry.redhat.io/amq7/amq-broker:7.5"
+          imagePullPolicy: Always
+          readinessProbe:
+            exec:
+              command:
+              - "/bin/bash"
+              - "-c"
+              - "/opt/amq/bin/readinessProbe.sh"            
+          name: "work-queue-broker-amq"
+          ports:
+          - containerPort: 8161
+            name: console-jolokia
+            protocol: TCP
+          - containerPort: 5672
+            name: amqp
+            protocol: TCP
+          - containerPort: 1883
+            name: mqtt
+            protocol: TCP
+          - containerPort: 61613
+            name: stomp
+            protocol: TCP
+          - containerPort: 61616
+            name: artemis
+            protocol: TCP
+        terminationGracePeriodSeconds: 60
+    triggers:
+    - type: ConfigChange
+

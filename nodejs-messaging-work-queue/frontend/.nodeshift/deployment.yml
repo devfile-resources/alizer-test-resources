@@ -1,0 +1,19 @@
+spec:
+  template:
+    spec:
+      containers:
+        - envFrom:
+          - configMapRef:
+              name: messaging-service
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+              scheme: HTTP
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 60
+            periodSeconds: 30
