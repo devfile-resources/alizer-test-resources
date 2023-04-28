@@ -1,0 +1,14 @@
+host: localhost
+listen: ':8080'
+
+log:
+  output: stderr
+
+handlers:
+  'backend':
+    type: proxy
+    url: http://localhost:9000/
+
+routes:
+  - path: /
+    handler: backend

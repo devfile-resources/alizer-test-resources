@@ -1,0 +1,13 @@
+#!/usr/bin/make -f
+
+include /usr/share/cdbs/1/rules/debhelper.mk
+
+install/fasthttpd::
+	install -p -d $(DEB_DESTDIR)/etc/fasthttpd
+	install -p -d $(DEB_DESTDIR)/lib/systemd/system
+	install -p -d $(DEB_DESTDIR)/usr/sbin
+	install -p -d $(DEB_DESTDIR)/usr/share/fasthttpd/html
+	install -p -d $(DEB_DESTDIR)/var/log/fasthttpd
+	install -p -m 0755 bin/fasthttpd $(DEB_DESTDIR)/usr/sbin
+	install -p -m 0755 src/etc/fasthttpd/config.yaml $(DEB_DESTDIR)/etc/fasthttpd
+	install -p -m 0755 src/usr/share/fasthttpd/html/* $(DEB_DESTDIR)/usr/share/fasthttpd/html
