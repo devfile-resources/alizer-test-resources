@@ -1,0 +1,21 @@
+{
+  "name": "express-prometheus-minishift",
+  "version": "1.0.0",
+  "description": "Example based on the blog post: https://developers.redhat.com/blog/2018/12/21/monitoring-node-js-applications-on-openshift-with-prometheus/",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js"
+  },
+  "files": [
+    "package.json",
+    "src"
+  ],
+  "author": "Helio Frota",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.17.1",
+    "nodemon": "^2.0.14",
+    "opossum": "6.2.1",
+    "opossum-prometheus": "0.3.0"
+  }
+}
