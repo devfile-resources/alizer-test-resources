@@ -1,0 +1,6 @@
+rabbitmq:
+  uri: amqp://rabbit-mq:5672
+mail:
+  queue:
+    send: mail.send.prod
+  from: prod@example.com
