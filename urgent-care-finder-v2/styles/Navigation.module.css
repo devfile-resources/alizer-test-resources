@@ -1,0 +1,18 @@
+.nav {
+  background-color: var(--light-green);
+  color: white;
+  padding: 1rem 1.1rem;
+  font-weight: bold;
+}
+
+.nav a {
+  text-decoration: none;
+  color: white;
+  text-shadow: 1px 1px rgba(0, 0, 0, 0.25);
+}
+
+@media (min-width: 772px) {
+  .nav {
+    padding: 1rem 4rem;
+  }
+}

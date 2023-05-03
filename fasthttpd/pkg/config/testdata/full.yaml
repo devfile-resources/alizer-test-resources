@@ -1,0 +1,130 @@
+host: localhost
+# NOTE: Define listen addr. It is supported ipv6 `[::1]:8080`
+listen: ':8080'
+root: ./public
+
+# Define fasthttp.Server settings.
+server:
+  name: fasthttpd
+  readBufferSize: 4096
+  writeBufferSize: 4096
+
+log:
+  output: logs/error.log
+  # NOTE: Flags supports date|time|microseconds
+  flags: [date, time]
+  rotation:
+    maxSize: 100
+
+accessLog:
+  output: logs/access.log
+  format: '%h %l %u %t "%r" %>s %b'
+  rotation:
+    maxSize: 100
+    maxBackups: 14
+    maxAge: 28
+    compress: true
+    localTime: true
+ 
+# Define custom error pages (x matches [0-9])
+errorPages:
+  '404': /err/404.html
+  '5xx': /err/5xx.html
+
+# Define named filters
+filters:
+
+  'auth':
+    type: basicAuth
+    users:
+      # WARNING: It is unsafe to define plain secrets. It is recommended for development use only.
+      - name: fast
+        secret: httpd
+    usersFile: ./users.yaml
+
+  'cache':
+    type: header
+    response:
+      set:
+        'Cache-Control': 'private, max-age=3600'
+
+# Define named handlers
+handlers:
+
+  'static':
+    type: fs
+    indexNames: [index.html]
+    generateIndexPages: false
+    compress: true
+
+  'hello':
+    type: content
+    headers:
+      'Content-Type': 'text/plain; charset=utf-8'
+    body: |
+      Hello FastHttpd
+
+# The routes are processed in sequence and interrupted when the status or the handler is specified.
+routes:
+
+  # Allows GET, POST, HEAD only.
+  - methods: [PUT, DELETE, CONNECT, OPTIONS, TRACE, PATCH]
+    status: 405
+    statusMessage: 'Method not allowed'
+
+  # Route to /index.html.
+  - path: /
+    match: equal
+    handler: static
+
+  # Redirect to external url with status code 302.
+  - path: /redirect-external
+    match: equal
+    rewrite: http://example.com/
+    status: 302
+
+  # Redirect to internal uri with status code 302 and appendQueryString.
+  # If "GET /redirect-internal?name=value" is requested then it redirect to "/internal?foo=bar&name=value"
+  - path: /redirect-internal
+    match: equal
+    rewrite: /internal?foo=bar
+    rewriteAppendQueryString: true
+    status: 302
+  
+  # Route to static resources using regexp.
+  - path: .*\.(js|css|jpg|png|gif|ico)$
+    match: regexp
+    filters: [cache]
+    methods: [GET, HEAD]
+    handler: static
+
+  # Rewrite the path and route to next (no handler and no status).
+  - path: ^/view/(.+)
+    match: regexp
+    rewrite: /view?id=$1
+
+  # Other requests are routed to hello with auth filter.
+  - filters: [auth]
+    handler: hello
+
+routesCache:
+  enable: true
+  expire: 60000
+
+---
+
+host: localhost
+listen: ':8443'
+
+ssl:
+  certFile: ./ssl/localhost.crt
+  keyFile: ./ssl/localhost.key
+
+handlers:
+  'backend':
+    type: proxy
+    url: 'http://localhost:8080'
+
+routes:
+  - path: /
+    handler: backend

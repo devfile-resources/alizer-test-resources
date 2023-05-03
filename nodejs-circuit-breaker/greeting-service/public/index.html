@@ -1,0 +1,239 @@
+<!--
+  ~
+  ~  Copyright 2017 Red Hat, Inc, and individual contributors.
+  ~
+  ~  Licensed under the Apache License, Version 2.0 (the "License");
+  ~  you may not use this file except in compliance with the License.
+  ~  You may obtain a copy of the License at
+  ~
+  ~  http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~  Unless required by applicable law or agreed to in writing, software
+  ~  distributed under the License is distributed on an "AS IS" BASIS,
+  ~  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~  See the License for the specific language governing permissions and
+  ~  limitations under the License.
+  ~
+  -->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Circuit Breaker Example - Node.js</title>
+    <link
+      rel="stylesheet"
+      href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css"
+      integrity="sha384-BVYiiSIFeK1dGmJRAkycuHAHRg32OmUcww7on3RYdg4Va+PmSTsz/K68vbdEjh4u"
+      crossorigin="anonymous"
+    />
+  </head>
+
+  <body>
+    <div class="container" id="app">
+      <div>
+        <h1>Circuit Breaker Example - Node.js</h1>
+        <p class="lead">
+          The Circuit Breaker pattern provides a generic mechanism for quickly
+          and easily reporting whether or not a service is functioning properly.
+          This allows a service to report information about a failure and decide
+          whether to quickly fail or simply degrade gracefully instead of
+          failing.
+        </p>
+        <p class="lead">
+          Modern cloud applications are often comprised of many smaller services
+          which interact with each other in a many-to-many manner. Understanding
+          when a service is failing or unavailable is critically important,
+          which is the main reason for the Health Check pattern. In some cases
+          though, you may want to provide an alternative response if a service
+          interacts with a failing or unavailable service. For example, if
+          <em>service1</em> interacts with <em>service2</em> and
+          <em>service2</em> begins to fail or become unavailable due to high
+          load, simply detecting the failure and restarting
+          <em>service2</em> may not alleviate the issue. Instead, you may want
+          to signal <em>service1</em> to reduce the amount of load it puts on
+          <em>service2</em> until <em>service2</em> returns to a normal state.
+        </p>
+        <p>
+          On this page you can invoke the <strong>greeting service</strong>.
+          This service uses a <strong>name service</strong>. The invocations are
+          protected by a circuit breaker. You can configure the state of the
+          name service using the <strong>toggle</strong> button.
+        </p>
+
+        <div class="row">
+          <div class="col-md-6">
+            <h2>Greeting service</h2>
+            <div id="circuit-state" v-html="circuitState"></div>
+            <button
+              id="invoke"
+              type="submit"
+              class="btn btn-primary"
+              @click="invokeFunction"
+            >
+              Invoke
+            </button>
+            <h3>Results:</h3>
+            <form class="form-inline" @submit.prevent="clearFunction">
+              <button id="clear" type="submit" class="btn btn-success">
+                Clear
+              </button>
+            </form>
+            <pre
+              style="min-height: 20em"
+            ><code id="greeting-result">{{greetingResult}}</code></pre>
+          </div>
+
+          <div class="col-md-6">
+            <h2>Name service</h2>
+            <div id="name-state" v-html="nameState"></div>
+            <form class="form-inline" @submit.prevent="toggleFunction">
+              <button id="toggle" type="submit" class="btn btn-primary">
+                Toggle
+              </button>
+            </form>
+            <h3>Requests:</h3>
+            <form class="form-inline" @submit.prevent="clearRequestFunction">
+              <button id="clear-requests" type="submit" class="btn btn-success">
+                Clear
+              </button>
+            </form>
+            <pre
+              style="min-height: 20em"
+            ><code id="name-requests">{{nameRequest}}</code></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script
+      src="https://cdnjs.cloudflare.com/ajax/libs/vue/2.7.10/vue.min.js"
+      integrity="sha512-H8u5mlZT1FD7MRlnUsODppkKyk+VEiCmncej8yZW1k/wUT90OQon0F9DSf/2Qh+7L/5UHd+xTLrMszjHEZc2BA=="
+      crossorigin="anonymous"
+      referrerpolicy="no-referrer"
+    ></script>
+    <script>
+      const app = new Vue({
+        el: "#app",
+        data: {
+          greetingResult: '',
+          nameServiceUrlBase: '',
+          nameState: '',
+          nameRequest: '',
+          circuitState: '',
+        },
+        methods: {
+          initializeServices() {
+            this.initNameServiceLocation()
+              .then(this.initNameServiceState)
+              .then(this.connectNameService)
+              .then(this.initCircuitState)
+              .then(this.connectCircuitService)
+              .catch(console.error);
+          },
+          async initNameServiceLocation() {
+            this.nameServiceUrlBase = window.location.origin.replace(
+              'greeting',
+              'name'
+            );
+            if (this.nameServiceUrlBase.includes('localhost')) {
+              const result = await fetch('/api/name-service-host');
+              const data = await result.json();
+              this.nameServiceUrlBase = data.host;
+              return Promise.resolve(this.nameServiceUrlBase);
+            }
+            return Promise.resolve(this.nameServiceUrlBase);
+          },
+          async initNameServiceState() {
+            const result = await fetch(`${this.nameServiceUrlBase}/api/info`);
+            const data = await result.json();
+            return await this.updateNameServiceState(data.state === 'ok');
+          },
+          async initCircuitState() {
+            const result = await fetch('/api/cb-state');
+            const data = await result.json();
+            return await this.updateCircuitState(data.state === 'open');
+          },
+          updateNameServiceState(state) {
+            if (state) {
+              this.nameState =
+                '<h3>Operational state: <span class="label label-info">OK</span></h3>';
+            } else {
+              this.nameState =
+                '<h3>Operational state: <span class="label label-warning">FAIL</span></h3>';
+            }
+          },
+          updateCircuitState(isOpen) {
+            if (isOpen) {
+              this.circuitState =
+                '<h3>Circuit breaker state: <span class="label label-warning">OPEN</span></h3>';
+            } else {
+              this.circuitState =
+                '<h3>Circuit breaker state: <span class="label label-info">CLOSED</span></h3>';
+            }
+          },
+          // WebSocket connections
+          connectNameService() {
+            const wsUrlBase = this.nameServiceUrlBase.replace(
+              'http://',
+              'ws://'
+            );
+            const socketUrl = `${wsUrlBase}/name-ws`;
+            const wsocket = new WebSocket(socketUrl);
+            wsocket.onmessage = this.onMessage;
+            return Promise.resolve(wsocket);
+          },
+          onMessage(evt) {
+            if (evt.data === 'state:true') {
+              this.updateNameServiceState(true);
+            } else if (evt.data === 'state:false') {
+              this.updateNameServiceState(false);
+            } else {
+              this.nameRequest += 'GET /name at ' + evt.data + '\n';
+            }
+          },
+          connectCircuitService() {
+            const cbWsUrlBase = window.location.origin.replace(
+              'http://',
+              'ws://'
+            );
+            const cbWsocket = new WebSocket(`${cbWsUrlBase}/cb-ws`);
+            cbWsocket.onmessage = (evt) => {
+              this.updateCircuitState(evt.data === 'isOpen:true');
+            };
+            return Promise.resolve(cbWsocket);
+          },
+          // UI event handlers./start
+          async invokeFunction() {
+            const result = await fetch('/api/greeting');
+            if (!result.ok) {
+              const message = `Error: ${result.status} - ${result.statusText}`;
+              throw new Error(message);
+            }
+            const data = await result.json();
+            this.greetingResult += JSON.stringify(data) + '\n';
+          },
+          clearFunction() {
+            this.greetingResult = '';
+          },
+         async toggleFunction() {
+            var newState = this.nameState.indexOf('FAIL') != -1 ? 'ok' : 'fail';
+            url = `${this.nameServiceUrlBase}/api/state`;
+            fetch(url, {
+              method: 'PUT',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                state: newState,
+              }),
+            });
+          },
+          clearRequestFunction() {
+            this.nameRequest = '';
+          },
+        },
+        mounted: function () {
+          this.initializeServices();
+        },
+      });
+    </script>
+  </body>
+</html>
