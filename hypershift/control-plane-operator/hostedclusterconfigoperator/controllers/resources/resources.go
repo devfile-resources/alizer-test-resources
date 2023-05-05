@@ -1,0 +1,1902 @@
+package resources
+
+import (
+	"context"
+	"crypto/md5"
+	"fmt"
+	"net/url"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	prometheusoperatorv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
+	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
+	"k8s.io/utils/pointer"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
+
+	"github.com/go-logr/logr"
+	configv1 "github.com/openshift/api/config/v1"
+	imageregistryv1 "github.com/openshift/api/imageregistry/v1"
+	operatorv1 "github.com/openshift/api/operator/v1"
+	hyperv1 "github.com/openshift/hypershift/api/v1beta1"
+	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane"
+	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/cloud/azure"
+	kubevirtcsi "github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/csi/kubevirt"
+	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/cvo"
+	cpomanifests "github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/manifests"
+	alerts "github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/alerts"
+	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/crd"
+	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/ingress"
+	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/konnectivity"
+	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/kubeadminpassword"
+	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/manifests"
+	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/monitoring"
+	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/namespaces"
+	networkoperator "github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/network"
+	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/oapi"
+	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/oauth"
+	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/olm"
+	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/rbac"
+	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/registry"
+	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/storage"
+	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/operator"
+	"github.com/openshift/hypershift/support/config"
+	"github.com/openshift/hypershift/support/globalconfig"
+	"github.com/openshift/hypershift/support/releaseinfo"
+	"github.com/openshift/hypershift/support/upsert"
+	"github.com/openshift/hypershift/support/util"
+	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
+)
+
+const (
+	ControllerName       = "resources"
+	SecretHashAnnotation = "hypershift.openshift.io/kubeadmin-secret-hash"
+	observedConfigKey    = "config"
+)
+
+var (
+	// deleteDNSOperatorDeploymentOnce ensures that the reconciler tries
+	// to delete any existing DNS operator deployment on the hosted cluster
+	// only once.
+	deleteDNSOperatorDeploymentOnce sync.Once
+	deleteCVORemovedResourcesOnce   sync.Once
+)
+
+type reconciler struct {
+	client         client.Client
+	uncachedClient client.Client
+	upsert.CreateOrUpdateProvider
+	platformType              hyperv1.PlatformType
+	rootCA                    string
+	clusterSignerCA           string
+	cpClient                  client.Client
+	kubevirtInfraClient       client.Client
+	hcpName                   string
+	hcpNamespace              string
+	releaseProvider           releaseinfo.Provider
+	konnectivityServerAddress string
+	konnectivityServerPort    int32
+	oauthAddress              string
+	oauthPort                 int32
+	versions                  map[string]string
+	operateOnReleaseImage     string
+	apiServerPort             int32
+}
+
+// eventHandler is the handler used throughout. As this controller reconciles all kind of different resources
+// it uses an empty request but always reconciles everything.
+func eventHandler() handler.EventHandler {
+	return handler.EnqueueRequestsFromMapFunc(
+		func(client.Object) []reconcile.Request {
+			return []reconcile.Request{{}}
+		})
+}
+
+func Setup(opts *operator.HostedClusterConfigOperatorConfig) error {
+	if err := imageregistryv1.AddToScheme(opts.Manager.GetScheme()); err != nil {
+		return fmt.Errorf("failed to add to scheme: %w", err)
+	}
+
+	apiServerPort := int32(443)
+	apiServerURL, err := url.Parse(opts.Manager.GetConfig().Host)
+	if err != nil {
+		return fmt.Errorf("failed to parse apiserver host %s as url: %w", opts.Manager.GetConfig().Host, err)
+	}
+	if p := apiServerURL.Port(); p != "" {
+		numericPort, err := strconv.Atoi(p)
+		if err != nil {
+			return fmt.Errorf("failed to parse apiserver port string %s as int: %w", p, err)
+		}
+		apiServerPort = int32(numericPort)
+	}
+	uncachedClient, err := client.New(opts.Manager.GetConfig(), client.Options{
+		Scheme: opts.Manager.GetScheme(),
+		Mapper: opts.Manager.GetRESTMapper(),
+		Opts: client.WarningHandlerOptions{
+			SuppressWarnings: true,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create uncached client: %w", err)
+	}
+
+	// if kubevirt infra config is not used, it is being set the same as the mgmt config
+	kubevirtInfraClient, err := client.New(opts.KubevirtInfraConfig, client.Options{
+		Scheme: opts.Manager.GetScheme(),
+		Mapper: opts.Manager.GetRESTMapper(),
+		Opts: client.WarningHandlerOptions{
+			SuppressWarnings: true,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create kubevirt infra uncached client: %w", err)
+	}
+
+	c, err := controller.New(ControllerName, opts.Manager, controller.Options{Reconciler: &reconciler{
+		client:                    opts.Manager.GetClient(),
+		uncachedClient:            uncachedClient,
+		CreateOrUpdateProvider:    opts.TargetCreateOrUpdateProvider,
+		platformType:              opts.PlatformType,
+		rootCA:                    opts.InitialCA,
+		clusterSignerCA:           opts.ClusterSignerCA,
+		cpClient:                  opts.CPCluster.GetClient(),
+		kubevirtInfraClient:       kubevirtInfraClient,
+		hcpName:                   opts.HCPName,
+		hcpNamespace:              opts.Namespace,
+		releaseProvider:           opts.ReleaseProvider,
+		konnectivityServerAddress: opts.KonnectivityAddress,
+		konnectivityServerPort:    opts.KonnectivityPort,
+		oauthAddress:              opts.OAuthAddress,
+		oauthPort:                 opts.OAuthPort,
+		versions:                  opts.Versions,
+		operateOnReleaseImage:     opts.OperateOnReleaseImage,
+		apiServerPort:             apiServerPort,
+	}})
+	if err != nil {
+		return fmt.Errorf("failed to construct controller: %w", err)
+	}
+	resourcesToWatch := []client.Object{
+		&imageregistryv1.Config{},
+		&corev1.ConfigMap{},
+		&corev1.Namespace{},
+		&corev1.Secret{},
+		&corev1.Service{},
+		&corev1.Endpoints{},
+		&corev1.PersistentVolumeClaim{},
+		&corev1.PersistentVolume{},
+		&rbacv1.ClusterRole{},
+		&rbacv1.ClusterRoleBinding{},
+		&configv1.Infrastructure{},
+		&configv1.DNS{},
+		&configv1.Ingress{},
+		&configv1.Network{},
+		&configv1.Proxy{},
+		&configv1.Build{},
+		&configv1.Image{},
+		&configv1.Project{},
+		&configv1.ClusterOperator{},
+		&appsv1.DaemonSet{},
+		&configv1.ClusterOperator{},
+		&configv1.ClusterVersion{},
+		&apiregistrationv1.APIService{},
+		&operatorv1.Network{},
+		&admissionregistrationv1.MutatingWebhookConfiguration{},
+		&prometheusoperatorv1.PrometheusRule{},
+		&operatorv1.IngressController{},
+		&imageregistryv1.Config{},
+	}
+	for _, r := range resourcesToWatch {
+		if err := c.Watch(&source.Kind{Type: r}, eventHandler()); err != nil {
+			return fmt.Errorf("failed to watch %T: %w", r, err)
+		}
+	}
+	if err := c.Watch(source.NewKindWithCache(&hyperv1.HostedControlPlane{}, opts.CPCluster.GetCache()), eventHandler()); err != nil {
+		return fmt.Errorf("failed to watch HostedControlPlane: %w", err)
+	}
+	return nil
+}
+
+func (r *reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
+	log := ctrl.LoggerFrom(ctx)
+	log.Info("Reconciling")
+
+	hcp := manifests.HostedControlPlane(r.hcpNamespace, r.hcpName)
+	if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(hcp), hcp); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to get hosted control plane %s/%s: %w", r.hcpNamespace, r.hcpName, err)
+	}
+
+	if !hcp.DeletionTimestamp.IsZero() {
+		if shouldCleanupCloudResources(hcp) {
+			log.Info("Cleaning up hosted cluster cloud resources")
+			return r.destroyCloudResources(ctx, hcp)
+		}
+		return ctrl.Result{}, nil
+	}
+
+	if isPaused, duration := util.IsReconciliationPaused(log, hcp.Spec.PausedUntil); isPaused {
+		log.Info("Reconciliation paused", "pausedUntil", *hcp.Spec.PausedUntil)
+		return ctrl.Result{RequeueAfter: duration}, nil
+	}
+	if r.operateOnReleaseImage != "" && r.operateOnReleaseImage != hcp.Spec.ReleaseImage {
+		log.Info("releaseImage is %s, but this operator is configured for %s, skipping reconciliation", hcp.Spec.ReleaseImage, r.operateOnReleaseImage)
+		return ctrl.Result{}, nil
+	}
+
+	pullSecret := manifests.PullSecret(hcp.Namespace)
+	if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(pullSecret), pullSecret); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to get pull secret: %w", err)
+	}
+
+	releaseImage, err := r.releaseProvider.Lookup(ctx, hcp.Spec.ReleaseImage, pullSecret.Data[corev1.DockerConfigJsonKey])
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to get lookup release image %s: %w", hcp.Spec.ReleaseImage, err)
+	}
+
+	var errs []error
+	log.Info("reconciling guest cluster crds")
+	if err := r.reconcileCRDs(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile crds: %w", err))
+	}
+
+	log.Info("reconciling kubernetes.default endpoints")
+	endpoints := manifests.APIServerEndpoints()
+	if _, err := r.CreateOrUpdate(ctx, r.client, endpoints, func() error {
+		if len(endpoints.Subsets) == 0 || len(endpoints.Subsets[0].Ports) == 0 {
+			return nil
+		}
+		endpoints.Subsets[0].Ports[0].Port = r.apiServerPort
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile kubernetes.default endpoints: %w", err))
+	}
+
+	log.Info("reconciling install configmap")
+	if err := r.reconcileInstallConfigMap(ctx, releaseImage); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile install configmap: %w", err))
+	}
+
+	log.Info("reconciling guest cluster alert rules")
+	if err := r.reconcileGuestClusterAlertRules(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile guest cluster alert rules: %w", err))
+	}
+
+	log.Info("reconciling clusterversion")
+	if err := r.reconcileClusterVersion(ctx, hcp); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile clusterversion: %w", err))
+	}
+
+	log.Info("reconciling clusterOperators")
+	if err := r.reconcileClusterOperators(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile clusterOperators: %w", err))
+	}
+
+	log.Info("reconciling guest cluster global configuration")
+	if err := r.reconcileConfig(ctx, hcp); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile global configuration: %w", err))
+	}
+
+	log.Info("reconciling guest cluster namespaces")
+	if err := r.reconcileNamespaces(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile namespaces: %w", err))
+	}
+
+	log.Info("reconciling guest cluster rbac")
+	if err := r.reconcileRBAC(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile rbac: %w", err))
+	}
+
+	log.Info("reconciling registry config")
+	registryConfig := manifests.Registry()
+	if _, err := r.CreateOrUpdate(ctx, r.client, registryConfig, func() error {
+		registry.ReconcileRegistryConfig(registryConfig, r.platformType, hcp.Spec.InfrastructureAvailabilityPolicy)
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile imageregistry config: %w", err))
+	}
+
+	log.Info("reconciling ingress controller")
+	if err := r.reconcileIngressController(ctx, hcp); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile ingress controller: %w", err))
+	}
+
+	log.Info("reconciling kube control plane signer secret")
+	kubeControlPlaneSignerSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "openshift-kube-apiserver-operator",
+			Name:      "kube-control-plane-signer",
+		},
+	}
+	if _, err := r.CreateOrUpdate(ctx, r.client, kubeControlPlaneSignerSecret, func() error {
+		kubeControlPlaneSignerSecret.Data = map[string][]byte{corev1.TLSCertKey: []byte(r.clusterSignerCA)}
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile the %s Secret: %w", client.ObjectKeyFromObject(kubeControlPlaneSignerSecret), err))
+	}
+
+	log.Info("reconciling kubelet serving CA configmap")
+	kubeletServingCAConfigMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "openshift-config-managed",
+			Name:      "kubelet-serving-ca",
+		},
+	}
+	if _, err := r.CreateOrUpdate(ctx, r.client, kubeletServingCAConfigMap, func() error {
+		kubeletServingCAConfigMap.Data = map[string]string{"ca-bundle.crt": r.clusterSignerCA}
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile the %s ConfigMap: %w", client.ObjectKeyFromObject(kubeletServingCAConfigMap), err))
+	}
+
+	log.Info("reconciling konnectivity agent")
+	if err := r.reconcileKonnectivityAgent(ctx, hcp, releaseImage); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile konnectivity agent: %w", err))
+	}
+
+	log.Info("reconciling openshift apiserver apiservices")
+	if err := r.reconcileOpenshiftAPIServerAPIServices(ctx, hcp); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile openshift apiserver service: %w", err))
+	}
+
+	log.Info("reconciling openshift apiserver service")
+	openshiftAPIServerService := manifests.OpenShiftAPIServerClusterService()
+	if _, err := r.CreateOrUpdate(ctx, r.client, openshiftAPIServerService, func() error {
+		oapi.ReconcileClusterService(openshiftAPIServerService)
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile openshift apiserver service: %w", err))
+	}
+
+	log.Info("reconciling openshift apiserver endpoints")
+	if err := r.reconcileOpenshiftAPIServerEndpoints(ctx, hcp); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile openshift apiserver endpoints: %w", err))
+	}
+
+	log.Info("reconciling openshift oauth apiserver apiservices")
+	if err := r.reconcileOpenshiftOAuthAPIServerAPIServices(ctx, hcp); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile openshift apiserver service: %w", err))
+	}
+
+	log.Info("reconciling openshift oauth apiserver service")
+	openshiftOAuthAPIServerService := manifests.OpenShiftOAuthAPIServerClusterService()
+	if _, err := r.CreateOrUpdate(ctx, r.client, openshiftOAuthAPIServerService, func() error {
+		oapi.ReconcileClusterService(openshiftOAuthAPIServerService)
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile openshift oauth apiserver service: %w", err))
+	}
+
+	log.Info("reconciling openshift oauth apiserver endpoints")
+	if err := r.reconcileOpenshiftOAuthAPIServerEndpoints(ctx, hcp); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile openshift apiserver endpoints: %w", err))
+	}
+
+	log.Info("reconciling kube apiserver service monitor")
+	kasServiceMonitor := manifests.KubeAPIServerServiceMonitor()
+	if _, err := r.CreateOrUpdate(ctx, r.client, kasServiceMonitor, func() error {
+		return monitoring.ReconcileKubeAPIServerServiceMonitor(kasServiceMonitor)
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile the kube apiserver service monitor: %w", err))
+	}
+
+	log.Info("reconciling kubeadmin password hash secret")
+	if err := r.reconcileKubeadminPasswordHashSecret(ctx, hcp); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile kubeadmin password hash secret: %w", err))
+	}
+
+	log.Info("reconciling network operator")
+	networkOperator := networkoperator.NetworkOperator()
+	if _, err := r.CreateOrUpdate(ctx, r.client, networkOperator, func() error {
+		networkoperator.ReconcileNetworkOperator(networkOperator, hcp.Spec.Networking.NetworkType, hcp.Spec.Platform.Type)
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile network operator: %w", err))
+	}
+
+	log.Info("reconciling pull secret")
+	for _, ns := range manifests.PullSecretTargetNamespaces() {
+		secret := manifests.PullSecret(ns)
+		if _, err := r.CreateOrUpdate(ctx, r.client, secret, func() error {
+			secret.Data = pullSecret.Data
+			secret.Type = pullSecret.Type
+			return nil
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile pull secret at namespace %s: %w", ns, err))
+		}
+	}
+
+	log.Info("reconciling oauth serving cert ca bundle")
+	if err := r.reconcileOAuthServingCertCABundle(ctx, hcp, r.oauthAddress); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile oauth serving cert CA bundle: %w", err))
+	}
+
+	log.Info("reconciling user cert CA bundle")
+	if err := r.reconcileUserCertCABundle(ctx, hcp); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile user cert CA bundle: %w", err))
+	}
+
+	log.Info("reconciling oauth browser client")
+	oauthBrowserClient := manifests.OAuthServerBrowserClient()
+	if _, err := r.CreateOrUpdate(ctx, r.client, oauthBrowserClient, func() error {
+		return oauth.ReconcileBrowserClient(oauthBrowserClient, r.oauthAddress, r.oauthPort)
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile oauth browser client: %w", err))
+	}
+
+	log.Info("reconciling oauth challenging client")
+	oauthChallengingClient := manifests.OAuthServerChallengingClient()
+	if _, err := r.CreateOrUpdate(ctx, r.client, oauthChallengingClient, func() error {
+		return oauth.ReconcileChallengingClient(oauthChallengingClient, r.oauthAddress, r.oauthPort)
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile oauth challenging client: %w", err))
+	}
+
+	log.Info("reconciling oauth serving cert rbac")
+	oauthServingCertRole := manifests.OAuthServingCertRole()
+	if _, err := r.CreateOrUpdate(ctx, r.client, oauthServingCertRole, func() error {
+		return oauth.ReconcileOauthServingCertRole(oauthServingCertRole)
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile oauth serving cert role: %w", err))
+	}
+
+	oauthServingCertRoleBinding := manifests.OAuthServingCertRoleBinding()
+	if _, err := r.CreateOrUpdate(ctx, r.client, oauthServingCertRoleBinding, func() error {
+		return oauth.ReconcileOauthServingCertRoleBinding(oauthServingCertRoleBinding)
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile oauth serving cert rolebinding: %w", err))
+	}
+
+	log.Info("reconciling cloud credential secrets")
+	errs = append(errs, r.reconcileCloudCredentialSecrets(ctx, hcp, log)...)
+
+	log.Info("reconciling in-cluster cloud config")
+	if err := r.reconcileCloudConfig(ctx, hcp); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile the cloud config: %w", err))
+	}
+
+	log.Info("reconciling openshift controller manager service ca bundle")
+	ocmServiceCA := manifests.OpenShiftControllerManagerServiceCA()
+	if _, err := r.CreateOrUpdate(ctx, r.client, ocmServiceCA, func() error {
+		if ocmServiceCA.Annotations == nil {
+			ocmServiceCA.Annotations = map[string]string{}
+		}
+		ocmServiceCA.Annotations["service.beta.openshift.io/inject-cabundle"] = "true"
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile openshift controller manager service ca bundle: %w", err))
+	}
+
+	log.Info("reconciling olm resources")
+	errs = append(errs, r.reconcileOLM(ctx, hcp)...)
+
+	if hostedcontrolplane.IsStorageAndCSIManaged(hcp) {
+		log.Info("reconciling storage resources")
+		errs = append(errs, r.reconcileStorage(ctx, hcp, releaseImage)...)
+
+		log.Info("reconciling node level csi configuration")
+		if err := r.reconcileCSIDriver(ctx, hcp, releaseImage); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	recyclerServiceAccount := manifests.RecyclerServiceAccount()
+	if _, err := r.CreateOrUpdate(ctx, r.client, recyclerServiceAccount, func() error {
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile pv recycler service account: %w", err))
+	}
+
+	log.Info("reconciling observed configuration")
+	errs = append(errs, r.reconcileObservedConfiguration(ctx, hcp)...)
+
+	// Delete the DNS operator deployment in the hosted cluster, if it is
+	// present there.  A separate DNS operator deployment runs as part of
+	// the hosted control-plane, but an upgraded cluster might still have
+	// an old DNS operator deployment in the hosted cluster.  The caching
+	// client has a label selector that doesn't match the deployment,
+	// so we must use the uncached client for this delete call.  To avoid
+	// excessive API calls using the uncached client, the delete call is
+	// guarded using a sync.Once.
+	if r.isClusterVersionUpdated(ctx, releaseImage.Version()) {
+		deleteDNSOperatorDeploymentOnce.Do(func() {
+			dnsOperatorDeployment := manifests.DNSOperatorDeployment()
+			log.Info("removing any existing DNS operator deployment")
+			if err := r.uncachedClient.Delete(ctx, dnsOperatorDeployment); err != nil && !apierrors.IsNotFound(err) {
+				errs = append(errs, err)
+			}
+		})
+		deleteCVORemovedResourcesOnce.Do(func() {
+			resources := cvo.ResourcesToRemove(hcp.Spec.Platform.Type)
+			for _, resource := range resources {
+				log.Info("removing existing resources", "resource", resource)
+				if err := r.uncachedClient.Delete(ctx, resource); err != nil && !apierrors.IsNotFound(err) {
+					errs = append(errs, err)
+				}
+			}
+		})
+	}
+
+	if hcp.Spec.Platform.Type == hyperv1.AWSPlatform {
+		errs = append(errs, r.reconcileAWSIdentityWebhook(ctx)...)
+	}
+
+	return ctrl.Result{}, errors.NewAggregate(errs)
+}
+
+func (r *reconciler) reconcileCSIDriver(ctx context.Context, hcp *hyperv1.HostedControlPlane, releaseImage *releaseinfo.ReleaseImage) error {
+	switch hcp.Spec.Platform.Type {
+	case hyperv1.KubevirtPlatform:
+		// Most csi drivers should be laid down by the Cluster Storage Operator (CSO) instead of
+		// the hcco operator. Only KubeVirt is unique at the moment.
+		err := kubevirtcsi.ReconcileTenant(r.client, hcp, ctx, r.CreateOrUpdate, releaseImage.ComponentImages())
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *reconciler) reconcileCRDs(ctx context.Context) error {
+	var errs []error
+
+	requestCount := manifests.RequestCountCRD()
+	if _, err := r.CreateOrUpdate(ctx, r.client, requestCount, func() error {
+		return crd.ReconcileRequestCountCRD(requestCount)
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile request count crd: %w", err))
+	}
+
+	return errors.NewAggregate(errs)
+}
+
+func (r *reconciler) reconcileConfig(ctx context.Context, hcp *hyperv1.HostedControlPlane) error {
+	var errs []error
+
+	apiServerAddress := hcp.Status.ControlPlaneEndpoint.Host
+
+	if len(apiServerAddress) == 0 {
+		return fmt.Errorf("hosted control plane does not have an APIServer endpoint address")
+	}
+
+	// Infrastructure is first reconciled for its spec
+	infra := globalconfig.InfrastructureConfig()
+	var currentInfra *configv1.Infrastructure
+	if _, err := r.CreateOrUpdate(ctx, r.client, infra, func() error {
+		currentInfra = infra.DeepCopy()
+		globalconfig.ReconcileInfrastructure(infra, hcp)
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile infrastructure config spec: %w", err))
+	} else {
+		// It is reconciled a second time to update its status
+		globalconfig.ReconcileInfrastructure(infra, hcp)
+		if !equality.Semantic.DeepEqual(infra.Status, currentInfra.Status) {
+			if err := r.client.Status().Update(ctx, infra); err != nil {
+				errs = append(errs, fmt.Errorf("failed to update infrastructure status: %w", err))
+			}
+		}
+	}
+
+	dns := globalconfig.DNSConfig()
+	if _, err := r.CreateOrUpdate(ctx, r.client, dns, func() error {
+		globalconfig.ReconcileDNSConfig(dns, hcp)
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile dns config: %w", err))
+	}
+
+	ingress := globalconfig.IngressConfig()
+	if _, err := r.CreateOrUpdate(ctx, r.client, ingress, func() error {
+		globalconfig.ReconcileIngressConfig(ingress, hcp)
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile ingress config: %w", err))
+	}
+
+	networkConfig := globalconfig.NetworkConfig()
+	if _, err := r.CreateOrUpdate(ctx, r.client, networkConfig, func() error {
+		globalconfig.ReconcileNetworkConfig(networkConfig, hcp)
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile network config: %w", err))
+	}
+
+	proxy := globalconfig.ProxyConfig()
+	if _, err := r.CreateOrUpdate(ctx, r.client, proxy, func() error {
+		globalconfig.ReconcileInClusterProxyConfig(proxy, hcp.Spec.Configuration)
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile proxy config: %w", err))
+	}
+
+	icsp := globalconfig.ImageContentSourcePolicy()
+	if _, err := r.CreateOrUpdate(ctx, r.client, icsp, func() error {
+		return globalconfig.ReconcileImageContentSourcePolicy(icsp, hcp)
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile image content source policy: %w", err))
+	}
+
+	installConfigCM := manifests.InstallConfigConfigMap()
+	if _, err := r.CreateOrUpdate(ctx, r.client, installConfigCM, func() error {
+		installConfigCM.Data = map[string]string{
+			"install-config": globalconfig.NewInstallConfig(hcp).String(),
+		}
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile dns config: %w", err))
+	}
+
+	return errors.NewAggregate(errs)
+}
+
+func (r *reconciler) reconcileNamespaces(ctx context.Context) error {
+	namespaceManifests := []struct {
+		manifest  func() *corev1.Namespace
+		reconcile func(*corev1.Namespace) error
+	}{
+		{manifest: manifests.NamespaceOpenShiftAPIServer},
+		{manifest: manifests.NamespaceOpenShiftInfra, reconcile: namespaces.ReconcileOpenShiftInfraNamespace},
+		{manifest: manifests.NamespaceOpenshiftCloudControllerManager},
+		{manifest: manifests.NamespaceOpenShiftControllerManager},
+		{manifest: manifests.NamespaceKubeAPIServer, reconcile: namespaces.ReconcileKubeAPIServerNamespace},
+		{manifest: manifests.NamespaceKubeControllerManager},
+		{manifest: manifests.NamespaceKubeScheduler},
+		{manifest: manifests.NamespaceEtcd},
+		{manifest: manifests.NamespaceIngress, reconcile: namespaces.ReconcileOpenShiftIngressNamespace},
+		{manifest: manifests.NamespaceAuthentication},
+		{manifest: manifests.NamespaceRouteControllerManager},
+	}
+
+	var errs []error
+	for _, m := range namespaceManifests {
+		ns := m.manifest()
+		if _, err := r.CreateOrUpdate(ctx, r.client, ns, func() error {
+			if m.reconcile != nil {
+				return m.reconcile(ns)
+			}
+			return nil
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile namespace %s: %w", ns.Name, err))
+		}
+	}
+
+	return errors.NewAggregate(errs)
+}
+
+type manifestAndReconcile[o client.Object] struct {
+	manifest  func() o
+	reconcile func(o) error
+}
+
+func (m manifestAndReconcile[o]) upsert(ctx context.Context, client client.Client, createOrUpdate upsert.CreateOrUpdateFN) error {
+	obj := m.manifest()
+	if _, err := createOrUpdate(ctx, client, obj, func() error {
+		return m.reconcile(obj)
+	}); err != nil {
+		return fmt.Errorf("failed to reconcile %T %s: %w", obj, obj.GetName(), err)
+	}
+
+	return nil
+}
+
+type manifestReconciler interface {
+	upsert(ctx context.Context, client client.Client, createOrUpdate upsert.CreateOrUpdateFN) error
+}
+
+func (r *reconciler) reconcileRBAC(ctx context.Context) error {
+	rbac := []manifestReconciler{
+		manifestAndReconcile[*rbacv1.ClusterRole]{manifest: manifests.CSRApproverClusterRole, reconcile: rbac.ReconcileCSRApproverClusterRole},
+		manifestAndReconcile[*rbacv1.ClusterRole]{manifest: manifests.IngressToRouteControllerClusterRole, reconcile: rbac.ReconcileIngressToRouteControllerClusterRole},
+		manifestAndReconcile[*rbacv1.ClusterRole]{manifest: manifests.NamespaceSecurityAllocationControllerClusterRole, reconcile: rbac.ReconcileNamespaceSecurityAllocationControllerClusterRole},
+
+		manifestAndReconcile[*rbacv1.Role]{manifest: manifests.IngressToRouteControllerRole, reconcile: rbac.ReconcileReconcileIngressToRouteControllerRole},
+
+		manifestAndReconcile[*rbacv1.ClusterRoleBinding]{manifest: manifests.CSRApproverClusterRoleBinding, reconcile: rbac.ReconcileCSRApproverClusterRoleBinding},
+		manifestAndReconcile[*rbacv1.ClusterRoleBinding]{manifest: manifests.IngressToRouteControllerClusterRoleBinding, reconcile: rbac.ReconcileIngressToRouteControllerClusterRoleBinding},
+		manifestAndReconcile[*rbacv1.ClusterRoleBinding]{manifest: manifests.NamespaceSecurityAllocationControllerClusterRoleBinding, reconcile: rbac.ReconcileNamespaceSecurityAllocationControllerClusterRoleBinding},
+		manifestAndReconcile[*rbacv1.ClusterRoleBinding]{manifest: manifests.NodeBootstrapperClusterRoleBinding, reconcile: rbac.ReconcileNodeBootstrapperClusterRoleBinding},
+		manifestAndReconcile[*rbacv1.ClusterRoleBinding]{manifest: manifests.CSRRenewalClusterRoleBinding, reconcile: rbac.ReconcileCSRRenewalClusterRoleBinding},
+		manifestAndReconcile[*rbacv1.ClusterRoleBinding]{manifest: manifests.MetricsClientClusterRoleBinding, reconcile: rbac.ReconcileGenericMetricsClusterRoleBinding("system:serviceaccount:hypershift:prometheus")},
+
+		manifestAndReconcile[*rbacv1.RoleBinding]{manifest: manifests.IngressToRouteControllerRoleBinding, reconcile: rbac.ReconcileIngressToRouteControllerRoleBinding},
+
+		manifestAndReconcile[*rbacv1.RoleBinding]{manifest: manifests.AuthenticatedReaderForAuthenticatedUserRolebinding, reconcile: rbac.ReconcileAuthenticatedReaderForAuthenticatedUserRolebinding},
+
+		manifestAndReconcile[*rbacv1.Role]{manifest: manifests.KCMLeaderElectionRole, reconcile: rbac.ReconcileKCMLeaderElectionRole},
+		manifestAndReconcile[*rbacv1.RoleBinding]{manifest: manifests.KCMLeaderElectionRoleBinding, reconcile: rbac.ReconcileKCMLeaderElectionRoleBinding},
+
+		manifestAndReconcile[*rbacv1.ClusterRole]{manifest: manifests.ImageTriggerControllerClusterRole, reconcile: rbac.ReconcileImageTriggerControllerClusterRole},
+		manifestAndReconcile[*rbacv1.ClusterRoleBinding]{manifest: manifests.ImageTriggerControllerClusterRoleBinding, reconcile: rbac.ReconcileImageTriggerControllerClusterRoleBinding},
+
+		manifestAndReconcile[*rbacv1.ClusterRole]{manifest: manifests.PodSecurityAdmissionLabelSyncerControllerClusterRole, reconcile: rbac.ReconcilePodSecurityAdmissionLabelSyncerControllerClusterRole},
+		manifestAndReconcile[*rbacv1.ClusterRoleBinding]{manifest: manifests.PodSecurityAdmissionLabelSyncerControllerRoleBinding, reconcile: rbac.ReconcilePodSecurityAdmissionLabelSyncerControllerRoleBinding},
+
+		manifestAndReconcile[*rbacv1.ClusterRole]{manifest: manifests.DeployerClusterRole, reconcile: rbac.ReconcileDeployerClusterRole},
+		manifestAndReconcile[*rbacv1.ClusterRoleBinding]{manifest: manifests.DeployerClusterRoleBinding, reconcile: rbac.ReconcileDeployerClusterRoleBinding},
+	}
+	var errs []error
+	for _, m := range rbac {
+		if err := m.upsert(ctx, r.client, r.CreateOrUpdate); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return errors.NewAggregate(errs)
+}
+
+func (r *reconciler) reconcileIngressController(ctx context.Context, hcp *hyperv1.HostedControlPlane) error {
+	var errs []error
+	p := ingress.NewIngressParams(hcp)
+	ingressController := manifests.IngressDefaultIngressController()
+	if _, err := r.CreateOrUpdate(ctx, r.client, ingressController, func() error {
+		return ingress.ReconcileDefaultIngressController(ingressController, p.IngressSubdomain, p.PlatformType, p.Replicas, p.IBMCloudUPI, p.IsPrivate)
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile default ingress controller: %w", err))
+	}
+
+	sourceCert := cpomanifests.IngressCert(hcp.Namespace)
+	if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(sourceCert), sourceCert); err != nil {
+		errs = append(errs, fmt.Errorf("failed to get ingress cert (%s/%s) from control plane: %w", sourceCert.Namespace, sourceCert.Name, err))
+	} else {
+		ingressControllerCert := manifests.IngressDefaultIngressControllerCert()
+		if _, err := r.CreateOrUpdate(ctx, r.client, ingressControllerCert, func() error {
+			return ingress.ReconcileDefaultIngressControllerCertSecret(ingressControllerCert, sourceCert)
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile default ingress controller cert: %w", err))
+		}
+	}
+
+	// Default Ingress is passed through as a subdomain of the infra/mgmt cluster
+	// for KubeVirt when the base domain passthrough feature is in use.
+	if hcp.Spec.Platform.Type == hyperv1.KubevirtPlatform &&
+		hcp.Spec.Platform.Kubevirt != nil &&
+		hcp.Spec.Platform.Kubevirt.BaseDomainPassthrough != nil &&
+		*hcp.Spec.Platform.Kubevirt.BaseDomainPassthrough {
+
+		// Here we are creating a route and service in the hosted control plane namespace
+		// while in the HCCO (which typically only works on the guest client, not the mgmt client).
+		//
+		// This is being done in the HCCO because we have to get the NodePort's port used by the
+		// default ingress services in the guest cluster in order to create the service in the
+		// mgmt/infra cluster. basically, the mgmt cluster service has to point the backend
+		// "somewhere", and that somewhere is the nodeport's port of the routers in the guest cluster.
+		// The component that can get that information about the nodeport's port is the HCCO, so
+		// that's why we're reconciling a service and route within hosted control plane in the HCCO
+
+		defaultIngressNodePortService := manifests.IngressDefaultIngressNodePortService()
+		err := r.client.Get(ctx, client.ObjectKeyFromObject(defaultIngressNodePortService), defaultIngressNodePortService)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to retrieve guest cluster ingress NodePort: %w", err))
+		}
+
+		var namespace string
+		if hcp.Spec.Platform.Kubevirt.Credentials != nil {
+			namespace = hcp.Spec.Platform.Kubevirt.Credentials.InfraNamespace
+		} else {
+			namespace = hcp.Namespace
+		}
+
+		// Manifests for infra/mgmt cluster passthrough service
+		cpService := manifests.IngressDefaultIngressPassthroughService(namespace)
+
+		cpService.Name = fmt.Sprintf("%s-%s",
+			manifests.IngressDefaultIngressPassthroughServiceName,
+			hcp.Spec.Platform.Kubevirt.GenerateID)
+
+		// Manifests for infra/mgmt cluster passthrough routes
+		cpPassthroughRoute := manifests.IngressDefaultIngressPassthroughRoute(namespace)
+
+		cpPassthroughRoute.Name = fmt.Sprintf("%s-%s",
+			manifests.IngressDefaultIngressPassthroughRouteName,
+			hcp.Spec.Platform.Kubevirt.GenerateID)
+
+		if _, err := r.CreateOrUpdate(ctx, r.kubevirtInfraClient, cpService, func() error {
+			return ingress.ReconcileDefaultIngressPassthroughService(cpService, defaultIngressNodePortService, hcp)
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile kubevirt ingress passthrough service: %w", err))
+		}
+
+		if _, err := r.CreateOrUpdate(ctx, r.kubevirtInfraClient, cpPassthroughRoute, func() error {
+			return ingress.ReconcileDefaultIngressPassthroughRoute(cpPassthroughRoute, cpService, hcp)
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile kubevirt ingress passthrough route: %w", err))
+		}
+	}
+
+	return errors.NewAggregate(errs)
+}
+
+func (r *reconciler) reconcileKonnectivityAgent(ctx context.Context, hcp *hyperv1.HostedControlPlane, releaseImage *releaseinfo.ReleaseImage) error {
+	var errs []error
+
+	// Set pod security labels on kube-system to avoid API warnings
+	kubeSystemNamespace := manifests.NamespaceKubeSystem()
+	if _, err := r.CreateOrUpdate(ctx, r.client, kubeSystemNamespace, func() error {
+		if kubeSystemNamespace.Labels == nil {
+			kubeSystemNamespace.Labels = map[string]string{}
+		}
+		kubeSystemNamespace.Labels["security.openshift.io/scc.podSecurityLabelSync"] = "false"
+		kubeSystemNamespace.Labels["pod-security.kubernetes.io/enforce"] = "privileged"
+		kubeSystemNamespace.Labels["pod-security.kubernetes.io/audit"] = "privileged"
+		kubeSystemNamespace.Labels["pod-security.kubernetes.io/warn"] = "privileged"
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to reconcile kube-system namespace: %w", err)
+	}
+
+	p := konnectivity.NewKonnectivityParams(hcp, releaseImage.ComponentImages(), r.konnectivityServerAddress, r.konnectivityServerPort)
+
+	controlPlaneKonnectivityCA := manifests.KonnectivityControlPlaneCAConfigMap(hcp.Namespace)
+	if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(controlPlaneKonnectivityCA), controlPlaneKonnectivityCA); err != nil {
+		errs = append(errs, fmt.Errorf("failed to get control plane konnectivity agent CA config map: %w", err))
+	} else {
+		hostedKonnectivityCA := manifests.KonnectivityHostedCAConfigMap()
+		if _, err := r.CreateOrUpdate(ctx, r.client, hostedKonnectivityCA, func() error {
+			util.CopyConfigMap(hostedKonnectivityCA, controlPlaneKonnectivityCA)
+			return nil
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile konnectivity CA config map: %w", err))
+		}
+	}
+
+	controlPlaneAgentSecret := manifests.KonnectivityControlPlaneAgentSecret(hcp.Namespace)
+	if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(controlPlaneAgentSecret), controlPlaneAgentSecret); err != nil {
+		errs = append(errs, fmt.Errorf("failed to get control plane konnectivity agent secret: %w", err))
+	} else {
+		agentSecret := manifests.KonnectivityAgentSecret()
+		if _, err := r.CreateOrUpdate(ctx, r.client, agentSecret, func() error {
+			konnectivity.ReconcileKonnectivityAgentSecret(agentSecret, controlPlaneAgentSecret)
+			return nil
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile konnectivity agent secret: %w", err))
+		}
+	}
+
+	proxy := &configv1.Proxy{ObjectMeta: metav1.ObjectMeta{Name: "cluster"}}
+	if err := r.client.Get(ctx, client.ObjectKeyFromObject(proxy), proxy); err != nil {
+		// If the cluster doesn't use a proxy this is irrelevant, so we don't return.
+		errs = append(errs, fmt.Errorf("failed to get proxy config: %w", err))
+	}
+
+	agentDaemonset := manifests.KonnectivityAgentDaemonSet()
+	if _, err := r.CreateOrUpdate(ctx, r.client, agentDaemonset, func() error {
+		konnectivity.ReconcileAgentDaemonSet(agentDaemonset, p.DeploymentConfig, p.Image, p.ExternalAddress, p.ExternalPort, hcp.Spec.Platform.Type, proxy.Status)
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile konnectivity agent daemonset: %w", err))
+	}
+
+	return errors.NewAggregate(errs)
+}
+
+func (r *reconciler) reconcileClusterVersion(ctx context.Context, hcp *hyperv1.HostedControlPlane) error {
+	clusterVersion := &configv1.ClusterVersion{ObjectMeta: metav1.ObjectMeta{Name: "version"}}
+	if _, err := r.CreateOrUpdate(ctx, r.client, clusterVersion, func() error {
+		clusterVersion.Spec.ClusterID = configv1.ClusterID(hcp.Spec.ClusterID)
+		clusterVersion.Spec.Capabilities = nil
+		clusterVersion.Spec.Upstream = ""
+		clusterVersion.Spec.Channel = hcp.Spec.Channel
+		clusterVersion.Spec.DesiredUpdate = nil
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to reconcile clusterVersion: %w", err)
+	}
+
+	return nil
+}
+
+func (r *reconciler) reconcileOpenshiftAPIServerAPIServices(ctx context.Context, hcp *hyperv1.HostedControlPlane) error {
+	rootCA := manifests.RootCASecret(hcp.Namespace)
+	if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(rootCA), rootCA); err != nil {
+		return fmt.Errorf("failed to get root ca from control plane: %w", err)
+	}
+	var errs []error
+	for _, apiSvcGroup := range manifests.OpenShiftAPIServerAPIServiceGroups() {
+		apiSvc := manifests.OpenShiftAPIServerAPIService(apiSvcGroup)
+		if _, err := r.CreateOrUpdate(ctx, r.client, apiSvc, func() error {
+			oapi.ReconcileAPIService(apiSvc, manifests.OpenShiftAPIServerClusterService(), rootCA, apiSvcGroup)
+			return nil
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile openshift apiserver apiservice (%s): %w", apiSvcGroup, err))
+		}
+	}
+	return errors.NewAggregate(errs)
+}
+
+func (r *reconciler) reconcileOpenshiftOAuthAPIServerAPIServices(ctx context.Context, hcp *hyperv1.HostedControlPlane) error {
+	rootCA := manifests.RootCASecret(hcp.Namespace)
+	if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(rootCA), rootCA); err != nil {
+		return fmt.Errorf("failed to get root ca from control plane: %w", err)
+	}
+	var errs []error
+	for _, apiSvcGroup := range manifests.OpenShiftOAuthAPIServerAPIServiceGroups() {
+		apiSvc := manifests.OpenShiftOAuthAPIServerAPIService(apiSvcGroup)
+		if _, err := r.CreateOrUpdate(ctx, r.client, apiSvc, func() error {
+			oapi.ReconcileAPIService(apiSvc, manifests.OpenShiftOAuthAPIServerClusterService(), rootCA, apiSvcGroup)
+			return nil
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile openshift oauth apiserver apiservice (%s): %w", apiSvcGroup, err))
+		}
+	}
+	return errors.NewAggregate(errs)
+}
+
+func (r *reconciler) reconcileOpenshiftAPIServerEndpoints(ctx context.Context, hcp *hyperv1.HostedControlPlane) error {
+	cpService := manifests.OpenShiftAPIServerService(hcp.Namespace)
+	if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(cpService), cpService); err != nil {
+		return fmt.Errorf("failed to get openshift apiserver service from control plane: %w", err)
+	}
+	if len(cpService.Spec.ClusterIP) == 0 {
+		return fmt.Errorf("openshift apiserver service in control plane does not yet have a cluster IP")
+	}
+	openshiftAPIServerEndpoints := manifests.OpenShiftAPIServerClusterEndpoints()
+	_, err := r.CreateOrUpdate(ctx, r.client, openshiftAPIServerEndpoints, func() error {
+		oapi.ReconcileEndpoints(openshiftAPIServerEndpoints, cpService.Spec.ClusterIP)
+		return nil
+	})
+	return err
+}
+
+func (r *reconciler) reconcileOpenshiftOAuthAPIServerEndpoints(ctx context.Context, hcp *hyperv1.HostedControlPlane) error {
+	cpService := manifests.OpenShiftOAuthAPIServerService(hcp.Namespace)
+	if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(cpService), cpService); err != nil {
+		return fmt.Errorf("failed to get openshift oauth apiserver service from control plane: %w", err)
+	}
+	if len(cpService.Spec.ClusterIP) == 0 {
+		return fmt.Errorf("openshift oauth apiserver service in control plane does not yet have a cluster IP")
+	}
+	openshiftOAuthAPIServerEndpoints := manifests.OpenShiftOAuthAPIServerClusterEndpoints()
+	_, err := r.CreateOrUpdate(ctx, r.client, openshiftOAuthAPIServerEndpoints, func() error {
+		oapi.ReconcileEndpoints(openshiftOAuthAPIServerEndpoints, cpService.Spec.ClusterIP)
+		return nil
+	})
+	return err
+}
+
+func (r *reconciler) reconcileKubeadminPasswordHashSecret(ctx context.Context, hcp *hyperv1.HostedControlPlane) error {
+	kubeadminPasswordSecret := manifests.KubeadminPasswordSecret(hcp.Namespace)
+	if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(kubeadminPasswordSecret), kubeadminPasswordSecret); err != nil {
+		if apierrors.IsNotFound(err) {
+			// kubeAdminPasswordHash should not exist when a user specifies an explicit oauth config
+			// delete kubeAdminPasswordHash if it exist
+			return r.deleteKubeadminPasswordHashSecret(ctx, hcp)
+		}
+		return fmt.Errorf("failed to get kubeadmin password secret: %w", err)
+	}
+
+	kubeadminPasswordHashSecret := manifests.KubeadminPasswordHashSecret()
+	if _, err := r.CreateOrUpdate(ctx, r.client, kubeadminPasswordHashSecret, func() error {
+		return kubeadminpassword.ReconcileKubeadminPasswordHashSecret(kubeadminPasswordHashSecret, kubeadminPasswordSecret)
+	}); err != nil {
+		return err
+	}
+	oauthDeployment := manifests.OAuthDeployment(hcp.Namespace)
+	if _, err := r.CreateOrUpdate(ctx, r.cpClient, oauthDeployment, func() error {
+		if oauthDeployment.Spec.Template.ObjectMeta.Annotations == nil {
+			oauthDeployment.Spec.Template.ObjectMeta.Annotations = map[string]string{}
+		}
+		oauthDeployment.Spec.Template.ObjectMeta.Annotations[SecretHashAnnotation] = secretHash(kubeadminPasswordHashSecret.Data["kubeadmin"])
+		return nil
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *reconciler) deleteKubeadminPasswordHashSecret(ctx context.Context, hcp *hyperv1.HostedControlPlane) error {
+	kubeadminPasswordHashSecret := manifests.KubeadminPasswordHashSecret()
+	if err := r.client.Get(ctx, client.ObjectKeyFromObject(kubeadminPasswordHashSecret), kubeadminPasswordHashSecret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	if err := r.client.Delete(ctx, kubeadminPasswordHashSecret); err != nil {
+		return err
+	}
+
+	oauthDeployment := manifests.OAuthDeployment(hcp.Namespace)
+	if _, err := r.CreateOrUpdate(ctx, r.cpClient, oauthDeployment, func() error {
+		delete(oauthDeployment.Spec.Template.ObjectMeta.Annotations, SecretHashAnnotation)
+		return nil
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func secretHash(data []byte) string {
+	return fmt.Sprintf("%x", md5.Sum(data))
+}
+
+func (r *reconciler) reconcileOAuthServingCertCABundle(ctx context.Context, hcp *hyperv1.HostedControlPlane, oauthHost string) error {
+	sourceBundle := cpomanifests.OpenShiftOAuthMasterCABundle(hcp.Namespace)
+	if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(sourceBundle), sourceBundle); err != nil {
+		return fmt.Errorf("cannot get oauth master ca bundle: %w", err)
+	}
+	caBundle := manifests.OAuthCABundle()
+	if _, err := r.CreateOrUpdate(ctx, r.client, caBundle, func() error {
+		return oauth.ReconcileOAuthServerCertCABundle(caBundle, sourceBundle)
+	}); err != nil {
+		return fmt.Errorf("failed to reconcile oauth server cert ca bundle: %w", err)
+	}
+	return nil
+}
+
+func (r *reconciler) reconcileUserCertCABundle(ctx context.Context, hcp *hyperv1.HostedControlPlane) error {
+	if hcp.Spec.AdditionalTrustBundle != nil {
+		cpUserCAConfigMap := manifests.ControlPlaneUserCABundle(hcp.Namespace)
+		if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(cpUserCAConfigMap), cpUserCAConfigMap); err != nil {
+			return fmt.Errorf("cannot get AdditionalTrustBundle ConfigMap: %w", err)
+		}
+		userCAConfigMap := manifests.UserCABundle()
+		if _, err := r.CreateOrUpdate(ctx, r.client, userCAConfigMap, func() error {
+			userCAConfigMap.Data = cpUserCAConfigMap.Data
+			return nil
+		}); err != nil {
+			return fmt.Errorf("failed to reconcile the %s ConfigMap: %w", client.ObjectKeyFromObject(userCAConfigMap), err)
+		}
+	}
+	return nil
+}
+
+const awsCredentialsTemplate = `[default]
+role_arn = %s
+web_identity_token_file = /var/run/secrets/openshift/serviceaccount/token
+`
+
+func (r *reconciler) reconcileCloudCredentialSecrets(ctx context.Context, hcp *hyperv1.HostedControlPlane, log logr.Logger) []error {
+	var errs []error
+	switch hcp.Spec.Platform.Type {
+	case hyperv1.AWSPlatform:
+		syncSecret := func(secret *corev1.Secret, arn string) error {
+			ns := &corev1.Namespace{}
+			err := r.client.Get(ctx, client.ObjectKey{Name: secret.Namespace}, ns)
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					log.Info("WARNING: cannot sync cloud credential secret because namespace does not exist", "secret", client.ObjectKeyFromObject(secret))
+					return nil
+				}
+				return fmt.Errorf("failed to get secret namespace %s: %w", secret.Namespace, err)
+			}
+			if _, err := r.CreateOrUpdate(ctx, r.client, secret, func() error {
+				credentials := fmt.Sprintf(awsCredentialsTemplate, arn)
+				secret.Data = map[string][]byte{"credentials": []byte(credentials)}
+				secret.Type = corev1.SecretTypeOpaque
+				return nil
+			}); err != nil {
+				return fmt.Errorf("failed to reconcile aws cloud credential secret %s/%s: %w", secret.Namespace, secret.Name, err)
+			}
+			return nil
+		}
+		for arn, secret := range map[string]*corev1.Secret{
+			hcp.Spec.Platform.AWS.RolesRef.IngressARN:       manifests.AWSIngressCloudCredsSecret(),
+			hcp.Spec.Platform.AWS.RolesRef.StorageARN:       manifests.AWSStorageCloudCredsSecret(),
+			hcp.Spec.Platform.AWS.RolesRef.ImageRegistryARN: manifests.AWSImageRegistryCloudCredsSecret(),
+		} {
+			err := syncSecret(secret, arn)
+			if err != nil {
+				errs = append(errs, err)
+			}
+		}
+	case hyperv1.AzurePlatform:
+		referenceCredentialsSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: hcp.Namespace, Name: hcp.Spec.Platform.Azure.Credentials.Name}}
+		if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(referenceCredentialsSecret), referenceCredentialsSecret); err != nil {
+			return []error{fmt.Errorf("failed to get cloud credentials secret in hcp namespace: %w", err)}
+		}
+
+		secretData := map[string][]byte{
+			"azure_client_id":       referenceCredentialsSecret.Data["AZURE_CLIENT_ID"],
+			"azure_client_secret":   referenceCredentialsSecret.Data["AZURE_CLIENT_SECRET"],
+			"azure_region":          []byte(hcp.Spec.Platform.Azure.Location),
+			"azure_resource_prefix": []byte(hcp.Name + "-" + hcp.Spec.InfraID),
+			"azure_resourcegroup":   []byte(hcp.Spec.Platform.Azure.ResourceGroupName),
+			"azure_subscription_id": referenceCredentialsSecret.Data["AZURE_SUBSCRIPTION_ID"],
+			"azure_tenant_id":       referenceCredentialsSecret.Data["AZURE_TENANT_ID"],
+		}
+
+		ingressCredentialSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "openshift-ingress-operator", Name: "cloud-credentials"}}
+		if _, err := r.CreateOrUpdate(ctx, r.client, ingressCredentialSecret, func() error {
+			ingressCredentialSecret.Data = secretData
+			return nil
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("failed tom reconcile guest cluster ingress operator secret: %w", err))
+		}
+
+		csiCredentialSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "openshift-cluster-csi-drivers", Name: "azure-disk-credentials"}}
+		if _, err := r.CreateOrUpdate(ctx, r.client, csiCredentialSecret, func() error {
+			csiCredentialSecret.Data = secretData
+			return nil
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile guest cluster CSI secret: %w", err))
+		}
+
+		imageRegistrySecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "openshift-image-registry", Name: "installer-cloud-credentials"}}
+		if _, err := r.CreateOrUpdate(ctx, r.client, imageRegistrySecret, func() error {
+			imageRegistrySecret.Data = secretData
+			return nil
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile guest cluster image-registry secret: %w", err))
+		}
+
+		cloudNetworkConfigControllerSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "openshift-cloud-network-config-controller", Name: "cloud-credentials"}}
+		if _, err := r.CreateOrUpdate(ctx, r.client, cloudNetworkConfigControllerSecret, func() error {
+			cloudNetworkConfigControllerSecret.Data = secretData
+			return nil
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile guest cluster cloud-network-config-controller secret: %w", err))
+		}
+
+		csiDriverSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "openshift-cluster-csi-drivers", Name: "azure-file-credentials"}}
+		if _, err := r.CreateOrUpdate(ctx, r.client, csiDriverSecret, func() error {
+			csiDriverSecret.Data = secretData
+			return nil
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile csi driver secret: %w", err))
+		}
+	case hyperv1.PowerVSPlatform:
+		createPowerVSSecret := func(srcSecret, destSecret *corev1.Secret) error {
+			_, err := r.CreateOrUpdate(ctx, r.client, destSecret, func() error {
+				credData, credHasData := srcSecret.Data["ibmcloud_api_key"]
+				if !credHasData {
+					return fmt.Errorf("secret %q is missing credentials key", destSecret.Name)
+				}
+				destSecret.Type = corev1.SecretTypeOpaque
+				if destSecret.Data == nil {
+					destSecret.Data = map[string][]byte{}
+				}
+				destSecret.Data["ibmcloud_api_key"] = credData
+				return nil
+			})
+			return err
+		}
+
+		var ingressCredentials corev1.Secret
+		err := r.cpClient.Get(ctx, client.ObjectKey{Namespace: hcp.Namespace, Name: hcp.Spec.Platform.PowerVS.IngressOperatorCloudCreds.Name}, &ingressCredentials)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to get ingress operator cloud credentials secret %s from hcp namespace : %w", hcp.Spec.Platform.PowerVS.IngressOperatorCloudCreds.Name, err))
+			return errs
+		}
+
+		cloudCredentials := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "openshift-ingress-operator",
+				Name:      "cloud-credentials",
+			},
+		}
+		err = createPowerVSSecret(&ingressCredentials, cloudCredentials)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile powervs ingress cloud credentials secret %w", err))
+		}
+
+		var storageCredentials corev1.Secret
+		err = r.cpClient.Get(ctx, client.ObjectKey{Namespace: hcp.Namespace, Name: hcp.Spec.Platform.PowerVS.StorageOperatorCloudCreds.Name}, &storageCredentials)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to get storage operator cloud credentials secret %s from hcp namespace : %w", hcp.Spec.Platform.PowerVS.StorageOperatorCloudCreds.Name, err))
+			return errs
+		}
+
+		ibmPowerVSCloudCredentials := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "openshift-cluster-csi-drivers",
+				Name:      "ibm-powervs-cloud-credentials",
+			},
+		}
+		err = createPowerVSSecret(&storageCredentials, ibmPowerVSCloudCredentials)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile powervs storage cloud credentials secret %w", err))
+		}
+	}
+	return errs
+}
+
+func (r *reconciler) reconcileOLM(ctx context.Context, hcp *hyperv1.HostedControlPlane) []error {
+	var errs []error
+
+	p := olm.NewOperatorLifecycleManagerParams(hcp)
+
+	catalogs := []struct {
+		manifest  func() *operatorsv1alpha1.CatalogSource
+		reconcile func(*operatorsv1alpha1.CatalogSource, *olm.OperatorLifecycleManagerParams)
+	}{
+		{manifest: manifests.CertifiedOperatorsCatalogSource, reconcile: olm.ReconcileCertifiedOperatorsCatalogSource},
+		{manifest: manifests.CommunityOperatorsCatalogSource, reconcile: olm.ReconcileCommunityOperatorsCatalogSource},
+		{manifest: manifests.RedHatMarketplaceCatalogSource, reconcile: olm.ReconcileRedHatMarketplaceCatalogSource},
+		{manifest: manifests.RedHatOperatorsCatalogSource, reconcile: olm.ReconcileRedHatOperatorsCatalogSource},
+	}
+
+	for _, catalog := range catalogs {
+		cs := catalog.manifest()
+		if _, err := r.CreateOrUpdate(ctx, r.client, cs, func() error {
+			catalog.reconcile(cs, p)
+			return nil
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile catalog source %s/%s: %w", cs.Namespace, cs.Name, err))
+		}
+	}
+
+	olmAlertRules := manifests.OLMAlertRules()
+	if _, err := r.CreateOrUpdate(ctx, r.client, olmAlertRules, func() error {
+		olm.ReconcileOLMAlertRules(olmAlertRules)
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile olm alert rules: %w", err))
+	}
+
+	rootCA := manifests.RootCASecret(hcp.Namespace)
+	if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(rootCA), rootCA); err != nil {
+		errs = append(errs, fmt.Errorf("failed to get root ca cert from control plane namespace: %w", err))
+	} else {
+		packageServerAPIService := manifests.OLMPackageServerAPIService()
+		if _, err := r.CreateOrUpdate(ctx, r.client, packageServerAPIService, func() error {
+			olm.ReconcilePackageServerAPIService(packageServerAPIService, rootCA)
+			return nil
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile OLM packageserver API service: %w", err))
+		}
+	}
+
+	packageServerService := manifests.OLMPackageServerService()
+	if _, err := r.CreateOrUpdate(ctx, r.client, packageServerService, func() error {
+		olm.ReconcilePackageServerService(packageServerService)
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile OLM packageserver service: %w", err))
+	}
+
+	cpService := manifests.OLMPackageServerControlPlaneService(hcp.Namespace)
+	if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(cpService), cpService); err != nil {
+		errs = append(errs, fmt.Errorf("failed to get packageserver service from control plane namespace: %w", err))
+	} else {
+		if len(cpService.Spec.ClusterIP) == 0 {
+			errs = append(errs, fmt.Errorf("packageserver service does not yet have a cluster IP"))
+		} else {
+			packageServerEndpoints := manifests.OLMPackageServerEndpoints()
+			if _, err := r.CreateOrUpdate(ctx, r.client, packageServerEndpoints, func() error {
+				olm.ReconcilePackageServerEndpoints(packageServerEndpoints, cpService.Spec.ClusterIP)
+				return nil
+			}); err != nil {
+				errs = append(errs, fmt.Errorf("failed to reconcile OLM packageserver service: %w", err))
+			}
+		}
+	}
+
+	return errs
+}
+
+func (r *reconciler) reconcileObservedConfiguration(ctx context.Context, hcp *hyperv1.HostedControlPlane) []error {
+	var errs []error
+	configs := []struct {
+		name       string
+		source     client.Object
+		observedCM *corev1.ConfigMap
+	}{
+		{
+			source:     globalconfig.ImageConfig(),
+			observedCM: globalconfig.ObservedImageConfig(hcp.Namespace),
+		},
+		{
+			source:     globalconfig.BuildConfig(),
+			observedCM: globalconfig.ObservedBuildConfig(hcp.Namespace),
+		},
+		{
+			source:     globalconfig.ProjectConfig(),
+			observedCM: globalconfig.ObservedProjectConfig(hcp.Namespace),
+		},
+	}
+
+	ownerRef := config.OwnerRefFrom(hcp)
+	for _, cfg := range configs {
+		err := func() error {
+			sourceConfig := cfg.source
+			if err := r.client.Get(ctx, client.ObjectKeyFromObject(sourceConfig), sourceConfig); err != nil {
+				if apierrors.IsNotFound(err) {
+					sourceConfig = nil
+				} else {
+					return fmt.Errorf("cannot get config (%s): %w", sourceConfig.GetName(), err)
+				}
+			}
+			observedConfig := cfg.observedCM
+			if sourceConfig == nil {
+				if err := r.cpClient.Delete(ctx, observedConfig); err != nil && !apierrors.IsNotFound(err) {
+					return fmt.Errorf("cannot delete observed config: %w", err)
+				}
+				return nil
+			}
+			if _, err := r.CreateOrUpdate(ctx, r.cpClient, observedConfig, func() error {
+				ownerRef.ApplyTo(observedConfig)
+				return globalconfig.ReconcileObservedConfig(observedConfig, sourceConfig)
+			}); err != nil {
+				return err
+			}
+			return nil
+		}()
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
+
+}
+
+func (r *reconciler) reconcileCloudConfig(ctx context.Context, hcp *hyperv1.HostedControlPlane) error {
+	// This is needed for the e2e tests and only for Azure: https://github.com/openshift/origin/blob/625733dd1ce7ebf40c3dd0abd693f7bb54f2d580/test/extended/util/cluster/cluster.go#L186
+	if hcp.Spec.Platform.Type != hyperv1.AzurePlatform {
+		return nil
+	}
+
+	reference := cpomanifests.AzureProviderConfig(hcp.Namespace)
+	if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(reference), reference); err != nil {
+		return fmt.Errorf("failed to fetch %s/%s configmap from management cluster: %w", reference.Namespace, reference.Name, err)
+	}
+
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "openshift-config", Name: "cloud-provider-config"}}
+	if _, err := r.CreateOrUpdate(ctx, r.client, cm, func() error {
+		if cm.Data == nil {
+			cm.Data = map[string]string{}
+		}
+		cm.Data["config"] = reference.Data[azure.CloudConfigKey]
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to reconcile the %s/%s configmap: %w", cm.Namespace, cm.Name, err)
+	}
+
+	return nil
+}
+
+func (r *reconciler) reconcileGuestClusterAlertRules(ctx context.Context) error {
+	var errs []error
+	apiUsageRule := manifests.ApiUsageRule()
+	if _, err := r.CreateOrUpdate(ctx, r.client, apiUsageRule, func() error {
+		return alerts.ReconcileApiUsageRule(apiUsageRule)
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile guest cluster api usage rule: %w", err))
+	}
+
+	return errors.NewAggregate(errs)
+}
+
+func (r *reconciler) reconcileAWSIdentityWebhook(ctx context.Context) []error {
+	var errs []error
+	clusterRole := manifests.AWSPodIdentityWebhookClusterRole()
+	if _, err := r.CreateOrUpdate(ctx, r.client, clusterRole, func() error {
+		clusterRole.Rules = []rbacv1.PolicyRule{{
+			APIGroups: []string{""},
+			Resources: []string{"serviceaccounts"},
+			Verbs: []string{
+				"get",
+				"list",
+				"watch",
+			},
+		}}
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile %T %s: %w", clusterRole, clusterRole.Name, err))
+	}
+
+	clusterRoleBinding := manifests.AWSPodIdentityWebhookClusterRoleBinding()
+	if _, err := r.CreateOrUpdate(ctx, r.client, clusterRoleBinding, func() error {
+		clusterRoleBinding.RoleRef.APIGroup = "rbac.authorization.k8s.io"
+		clusterRoleBinding.RoleRef.Kind = "ClusterRole"
+		clusterRoleBinding.RoleRef.Name = clusterRole.Name
+		clusterRoleBinding.Subjects = []rbacv1.Subject{{
+			Kind:      "ServiceAccount",
+			Name:      "aws-pod-identity-webhook",
+			Namespace: "openshift-authentication",
+		}}
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile %T %s: %w", clusterRoleBinding, clusterRoleBinding.Name, err))
+	}
+
+	ignoreFailurePolicy := admissionregistrationv1.Ignore
+	sideEffectsNone := admissionregistrationv1.SideEffectClassNone
+	webhook := manifests.AWSPodIdentityWebhook()
+	if _, err := r.CreateOrUpdate(ctx, r.client, webhook, func() error {
+		webhook.Webhooks = []admissionregistrationv1.MutatingWebhook{{
+			AdmissionReviewVersions: []string{"v1beta1"},
+			Name:                    "pod-identity-webhook.amazonaws.com",
+			ClientConfig: admissionregistrationv1.WebhookClientConfig{
+				CABundle: []byte(r.rootCA),
+				URL:      pointer.String("https://127.0.0.1:4443/mutate"),
+			},
+			FailurePolicy: &ignoreFailurePolicy,
+			Rules: []admissionregistrationv1.RuleWithOperations{{
+				Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
+				Rule: admissionregistrationv1.Rule{
+					APIGroups:   []string{""},
+					APIVersions: []string{"v1"},
+					Resources:   []string{"pods"},
+				},
+			}},
+			SideEffects: &sideEffectsNone,
+		}}
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile %T %s: %w", webhook, webhook.Name, err))
+	}
+
+	return errs
+}
+
+func (r *reconciler) destroyCloudResources(ctx context.Context, hcp *hyperv1.HostedControlPlane) (ctrl.Result, error) {
+	remaining, err := r.ensureCloudResourcesDestroyed(ctx, hcp)
+
+	var status metav1.ConditionStatus
+	var reason, message string
+
+	if err != nil {
+		reason = "ErrorOccurred"
+		status = metav1.ConditionFalse
+		message = fmt.Sprintf("Error: %v", err)
+	} else {
+		if remaining.Len() == 0 {
+			reason = "CloudResourcesDestroyed"
+			status = metav1.ConditionTrue
+			message = "All guest resources destroyed"
+		} else {
+			reason = "RemainingCloudResources"
+			status = metav1.ConditionFalse
+			message = fmt.Sprintf("Remaining resources: %s", strings.Join(remaining.List(), ","))
+		}
+	}
+	resourcesDestroyedCond := &metav1.Condition{
+		Type:    string(hyperv1.CloudResourcesDestroyed),
+		Status:  status,
+		Reason:  reason,
+		Message: message,
+		// Here LastTransitionTime is used to indicate the last time the condition was updated by this
+		// controller. This is used by the CPO as a heartbeat to determine whether resource deletion is
+		// still in progress.
+		LastTransitionTime: metav1.Now(),
+	}
+	// Ensure the LastTransitionTime is updated because the hostedcontrolplane controller relies on that
+	// timestamp to use as a heartbeat.
+	setStatusConditionWithTransitionUpdate(&hcp.Status.Conditions, *resourcesDestroyedCond)
+	if err := r.cpClient.Status().Update(ctx, hcp); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to set resources destroyed condition: %w", err)
+	}
+
+	if remaining.Len() > 0 {
+		// If we are still waiting for resources to go away, ensure we are requeued in at most 30 secs
+		// so we can at least update the timestamp on the condition.
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	} else {
+		return ctrl.Result{}, nil
+	}
+}
+
+func setStatusConditionWithTransitionUpdate(conditions *[]metav1.Condition, newCondition metav1.Condition) {
+	if conditions == nil {
+		return
+	}
+	existingCondition := meta.FindStatusCondition(*conditions, newCondition.Type)
+	if existingCondition == nil {
+		if newCondition.LastTransitionTime.IsZero() {
+			newCondition.LastTransitionTime = metav1.NewTime(time.Now())
+		}
+		*conditions = append(*conditions, newCondition)
+		return
+	}
+
+	// Always update the LastTransition time
+	existingCondition.Status = newCondition.Status
+	if !newCondition.LastTransitionTime.IsZero() {
+		existingCondition.LastTransitionTime = newCondition.LastTransitionTime
+	} else {
+		existingCondition.LastTransitionTime = metav1.NewTime(time.Now())
+	}
+
+	existingCondition.Reason = newCondition.Reason
+	existingCondition.Message = newCondition.Message
+	existingCondition.ObservedGeneration = newCondition.ObservedGeneration
+}
+
+func (r *reconciler) ensureCloudResourcesDestroyed(ctx context.Context, hcp *hyperv1.HostedControlPlane) (sets.String, error) {
+	log := ctrl.LoggerFrom(ctx)
+	remaining := sets.NewString()
+	log.Info("Ensuring resource creation is blocked in cluster")
+	if err := r.ensureResourceCreationIsBlocked(ctx); err != nil {
+		return remaining, err
+	}
+	var errs []error
+	log.Info("Ensuring image registry storage is removed")
+	removed, err := r.ensureImageRegistryStorageRemoved(ctx)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	if !removed {
+		remaining.Insert("image-registry")
+	}
+	log.Info("Ensuring ingress controllers are removed")
+	removed, err = r.ensureIngressControllersRemoved(ctx, hcp)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	if !removed {
+		remaining.Insert("ingress-controllers")
+	}
+	log.Info("Ensuring load balancers are removed")
+	removed, err = r.ensureServiceLoadBalancersRemoved(ctx)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	if !removed {
+		remaining.Insert("loadbalancers")
+	}
+	log.Info("Ensuring persistent volumes are removed")
+	removed, err = r.ensurePersistentVolumesRemoved(ctx)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	if !removed {
+		remaining.Insert("persistent-volumes")
+	}
+
+	return remaining, errors.NewAggregate(errs)
+}
+
+func (r *reconciler) ensureResourceCreationIsBlocked(ctx context.Context) error {
+	wh := manifests.ResourceCreationBlockerWebhook()
+	if _, err := r.CreateOrUpdate(ctx, r.client, wh, func() error {
+		reconcileCreationBlockerWebhook(wh)
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to reconcile resource cleanup webhook: %w", err)
+	}
+	return nil
+}
+
+func reconcileCreationBlockerWebhook(wh *admissionregistrationv1.ValidatingWebhookConfiguration) {
+	failurePolicy := admissionregistrationv1.Fail
+	sideEffectClass := admissionregistrationv1.SideEffectClassNone
+	allScopes := admissionregistrationv1.AllScopes
+	equivalentMatch := admissionregistrationv1.Equivalent
+	wh.Webhooks = []admissionregistrationv1.ValidatingWebhook{
+		{
+			AdmissionReviewVersions: []string{"v1"},
+			Name:                    "block-resources.hypershift.openshift.io",
+			ClientConfig: admissionregistrationv1.WebhookClientConfig{
+				Service: &admissionregistrationv1.ServiceReference{
+					Namespace: "default",
+					Name:      "xxx-invalid-service-xxx",
+					Path:      pointer.String("/validate"),
+					Port:      pointer.Int32(443),
+				},
+			},
+			FailurePolicy: &failurePolicy,
+			Rules: []admissionregistrationv1.RuleWithOperations{
+				{
+					Operations: []admissionregistrationv1.OperationType{
+						admissionregistrationv1.Create,
+					},
+					Rule: admissionregistrationv1.Rule{
+						APIGroups:   []string{""},
+						APIVersions: []string{"v1"},
+						Resources: []string{
+							"pods",
+							"persistentvolumeclaims",
+							"persistentvolumes",
+							"services",
+						},
+						Scope: &allScopes,
+					},
+				},
+				{
+					Operations: []admissionregistrationv1.OperationType{
+						admissionregistrationv1.Create,
+					},
+					Rule: admissionregistrationv1.Rule{
+						APIGroups:   []string{"operator.openshift.io"},
+						APIVersions: []string{"v1"},
+						Resources: []string{
+							"ingresscontrollers",
+						},
+						Scope: &allScopes,
+					},
+				},
+			},
+			MatchPolicy:       &equivalentMatch,
+			SideEffects:       &sideEffectClass,
+			TimeoutSeconds:    pointer.Int32(30),
+			NamespaceSelector: &metav1.LabelSelector{},
+			ObjectSelector:    &metav1.LabelSelector{},
+		},
+	}
+}
+
+func (r *reconciler) ensureIngressControllersRemoved(ctx context.Context, hcp *hyperv1.HostedControlPlane) (bool, error) {
+	log := ctrl.LoggerFrom(ctx)
+	ingressControllers := &operatorv1.IngressControllerList{}
+	if err := r.client.List(ctx, ingressControllers); err != nil {
+		return false, fmt.Errorf("failed to list ingress controllers: %w", err)
+	}
+	if len(ingressControllers.Items) == 0 {
+		log.Info("There are no ingresscontrollers, nothing to do")
+		return true, nil
+	}
+	var errs []error
+	for i := range ingressControllers.Items {
+		ic := &ingressControllers.Items[i]
+		if ic.DeletionTimestamp.IsZero() {
+			log.Info("Deleting ingresscontroller", "name", client.ObjectKeyFromObject(ic))
+			if err := r.client.Delete(ctx, ic); err != nil {
+				errs = append(errs, fmt.Errorf("failed to delete %s", client.ObjectKeyFromObject(ic).String()))
+			}
+		}
+	}
+	if len(errs) > 0 {
+		return false, fmt.Errorf("failed to delete ingress controllers: %w", errors.NewAggregate(errs))
+	}
+
+	// Force deleting pods under openshift-ingress to unblock ingress-controller deletion.
+	// Ingress-operator is dependent on these pods deletion on removing the finalizers of ingress-controller.
+	routerPods := &corev1.PodList{}
+	if err := r.uncachedClient.List(ctx, routerPods, &client.ListOptions{Namespace: "openshift-ingress"}); err != nil {
+		return false, fmt.Errorf("failed to list pods under openshift-ingress namespace: %w", err)
+	}
+
+	for i := range routerPods.Items {
+		rp := &routerPods.Items[i]
+		log.Info("Force deleting", "pod", client.ObjectKeyFromObject(rp).String())
+		if err := r.client.Delete(ctx, rp, &client.DeleteOptions{GracePeriodSeconds: pointer.Int64Ptr(0)}); err != nil {
+			errs = append(errs, fmt.Errorf("failed to force delete %s", client.ObjectKeyFromObject(rp).String()))
+		}
+	}
+
+	if len(errs) > 0 {
+		return false, fmt.Errorf("failed to force delete pods under openshift-ingress namespace: %w", errors.NewAggregate(errs))
+	}
+
+	// Remove ingress service and route that were created by HCCO in case of basedomain passthrough feature is enabled
+	if hcp.Spec.Platform.Type == hyperv1.KubevirtPlatform &&
+		hcp.Spec.Platform.Kubevirt != nil &&
+		hcp.Spec.Platform.Kubevirt.BaseDomainPassthrough != nil &&
+		*hcp.Spec.Platform.Kubevirt.BaseDomainPassthrough {
+		{
+			var namespace string
+			if hcp.Spec.Platform.Kubevirt.Credentials != nil {
+				namespace = hcp.Spec.Platform.Kubevirt.Credentials.InfraNamespace
+			} else {
+				namespace = hcp.Namespace
+			}
+			cpService := manifests.IngressDefaultIngressPassthroughService(namespace)
+			cpService.Name = fmt.Sprintf("%s-%s",
+				manifests.IngressDefaultIngressPassthroughServiceName,
+				hcp.Spec.Platform.Kubevirt.GenerateID)
+
+			cpPassthroughRoute := manifests.IngressDefaultIngressPassthroughRoute(namespace)
+			cpPassthroughRoute.Name = fmt.Sprintf("%s-%s",
+				manifests.IngressDefaultIngressPassthroughRouteName,
+				hcp.Spec.Platform.Kubevirt.GenerateID)
+
+			err := r.kubevirtInfraClient.Delete(ctx, cpService)
+			if err != nil && !apierrors.IsNotFound(err) {
+				errs = append(errs, fmt.Errorf("failed to delete %s: %w", client.ObjectKeyFromObject(cpService).String(), err))
+			}
+
+			err = r.kubevirtInfraClient.Delete(ctx, cpPassthroughRoute)
+			if err != nil && !apierrors.IsNotFound(err) {
+				errs = append(errs, fmt.Errorf("failed to delete %s: %w", client.ObjectKeyFromObject(cpPassthroughRoute).String(), err))
+			}
+		}
+	}
+
+	if len(errs) > 0 {
+		return false, fmt.Errorf("failed to delete ingress resources on infra cluster: %w", errors.NewAggregate(errs))
+	}
+
+	return false, nil
+}
+
+func (r *reconciler) ensureImageRegistryStorageRemoved(ctx context.Context) (bool, error) {
+	log := ctrl.LoggerFrom(ctx)
+	registryConfig := manifests.Registry()
+	if err := r.client.Get(ctx, client.ObjectKeyFromObject(registryConfig), registryConfig); err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Info("registry operator config does not exist, nothing to do")
+			return true, nil
+		}
+		return false, fmt.Errorf("failed to get registry operator configuration: %w", err)
+	}
+	// If storage has already been removed, nothing to do
+	// When the registry operator has been removed, management state in status is currently cleared.
+	if registryConfig.Status.Storage.ManagementState == "" || registryConfig.Status.Storage.ManagementState == "Removed" {
+		log.Info("Registry operator management state is blank or removed, done cleaning up")
+		return true, nil
+	}
+	log.Info("Setting management state for registry operator to removed")
+	if _, err := r.CreateOrUpdate(ctx, r.client, registryConfig, func() error {
+		registryConfig.Spec.ManagementState = operatorv1.Removed
+		return nil
+	}); err != nil {
+		return false, fmt.Errorf("failed to update image registry management state: %w", err)
+	}
+	return false, nil
+}
+
+func (r *reconciler) ensureServiceLoadBalancersRemoved(ctx context.Context) (bool, error) {
+	found, err := cleanupResources(ctx, r.client, &corev1.ServiceList{}, func(obj client.Object) bool {
+		svc := obj.(*corev1.Service)
+		return svc.Spec.Type == corev1.ServiceTypeLoadBalancer
+	}, false)
+	if err != nil {
+		return false, fmt.Errorf("failed to remove load balancer services: %w", err)
+	}
+	return !found, nil
+}
+
+func (r *reconciler) ensurePersistentVolumesRemoved(ctx context.Context) (bool, error) {
+	log := ctrl.LoggerFrom(ctx)
+	pvs := &corev1.PersistentVolumeList{}
+	if err := r.client.List(ctx, pvs); err != nil {
+		return false, fmt.Errorf("cannot list persistent volumes: %w", err)
+	}
+	if len(pvs.Items) == 0 {
+		log.Info("There are no more persistent volumes. Nothing to cleanup.")
+		return true, nil
+	}
+	if _, err := cleanupResources(ctx, r.client, &corev1.PersistentVolumeClaimList{}, nil, false); err != nil {
+		return false, fmt.Errorf("failed to remove persistent volume claims: %w", err)
+	}
+	if _, err := cleanupResources(ctx, r.uncachedClient, &corev1.PodList{}, func(obj client.Object) bool {
+		pod := obj.(*corev1.Pod)
+		return hasAttachedPVC(pod)
+	}, true); err != nil {
+		return false, fmt.Errorf("failed to remove pods: %w", err)
+	}
+	return false, nil
+}
+
+func (r *reconciler) reconcileInstallConfigMap(ctx context.Context, releaseImage *releaseinfo.ReleaseImage) error {
+	cm := manifests.InstallConfigMap()
+	if _, err := r.CreateOrUpdate(ctx, r.client, cm, func() error {
+		if cm.Data == nil {
+			cm.Data = map[string]string{}
+		}
+		cm.Data["invoker"] = "hypershift"
+		// Only set 'version' if unset. This is meant to preserve the version with
+		// which the cluster was installed and not followup upgrade versions.
+		if _, hasVersion := cm.Data["version"]; !hasVersion {
+			componentVersions, err := releaseImage.ComponentVersions()
+			if err != nil {
+				return fmt.Errorf("failed to look up component versions: %w", err)
+			}
+			cm.Data["version"] = componentVersions["release"]
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to reconcile install configmap: %w", err)
+	}
+	return nil
+}
+
+func hasAttachedPVC(pod *corev1.Pod) bool {
+	for _, v := range pod.Spec.Volumes {
+		if v.PersistentVolumeClaim != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldCleanupCloudResources(hcp *hyperv1.HostedControlPlane) bool {
+	return hcp.Annotations[hyperv1.CleanupCloudResourcesAnnotation] == "true" &&
+		meta.IsStatusConditionTrue(hcp.Status.Conditions, string(hyperv1.CVOScaledDown))
+}
+
+// cleanupResources generically deletes resources of a given type using an optional filter
+// function. The result is a boolean indicating whether resources were found that match
+// the filter and an error if one occurred.
+func cleanupResources(ctx context.Context, c client.Client, list client.ObjectList, filter func(client.Object) bool, force bool) (bool, error) {
+	log := ctrl.LoggerFrom(ctx)
+	if err := c.List(ctx, list); err != nil {
+		return false, fmt.Errorf("cannot list %T: %w", list, err)
+	}
+
+	var errs []error
+	foundResource := false
+	a := listAccessor(list)
+	for i := 0; i < a.len(); i++ {
+		obj := a.item(i)
+		if filter == nil || filter(obj) {
+			foundResource = true
+			if obj.GetDeletionTimestamp().IsZero() {
+				log.Info("Deleting resource", "type", fmt.Sprintf("%T", obj), "name", client.ObjectKeyFromObject(obj).String())
+				var deleteErr error
+				if force {
+					deleteErr = c.Delete(ctx, obj, &client.DeleteOptions{GracePeriodSeconds: pointer.Int64Ptr(0)})
+				} else {
+					deleteErr = c.Delete(ctx, obj)
+				}
+				if deleteErr != nil {
+					errs = append(errs, deleteErr)
+				}
+			}
+		}
+	}
+	return foundResource, errors.NewAggregate(errs)
+}
+
+type genericListAccessor struct {
+	items reflect.Value
+}
+
+func listAccessor(list client.ObjectList) *genericListAccessor {
+	return &genericListAccessor{
+		items: reflect.ValueOf(list).Elem().FieldByName("Items"),
+	}
+}
+
+func (a *genericListAccessor) len() int {
+	return a.items.Len()
+}
+
+func (a *genericListAccessor) item(i int) client.Object {
+	return (a.items.Index(i).Addr().Interface()).(client.Object)
+}
+
+func (r *reconciler) isClusterVersionUpdated(ctx context.Context, version string) bool {
+	log := ctrl.LoggerFrom(ctx)
+	var clusterVersion configv1.ClusterVersion
+	err := r.client.Get(ctx, types.NamespacedName{Name: "version"}, &clusterVersion)
+	if err != nil {
+		log.Error(err, "unable to retrieve cluster version resource")
+		return false
+	}
+	if clusterVersion.Status.Desired.Version != version {
+		log.Info(fmt.Sprintf("cluster version not yet updated to %s", version))
+		return false
+	}
+	return true
+}
+
+func (r *reconciler) reconcileStorage(ctx context.Context, hcp *hyperv1.HostedControlPlane, releaseImage *releaseinfo.ReleaseImage) []error {
+	var errs []error
+
+	snapshotController := manifests.CSISnapshotController()
+	if _, err := r.CreateOrUpdate(ctx, r.client, snapshotController, func() error {
+		storage.ReconcileCSISnapshotController(snapshotController)
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile CSISnapshotController : %w", err))
+	}
+
+	storageCR := manifests.Storage()
+	if _, err := r.CreateOrUpdate(ctx, r.client, storageCR, func() error {
+		storage.ReconcileStorage(storageCR)
+		return nil
+	}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to reconcile Storage : %w", err))
+	}
+
+	if hcp.Spec.Platform.Type == hyperv1.AWSPlatform {
+		driver := manifests.ClusterCSIDriver(operatorv1.AWSEBSCSIDriver)
+		if _, err := r.CreateOrUpdate(ctx, r.client, driver, func() error {
+			storage.ReconcileClusterCSIDriver(driver)
+			return nil
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile ClusterCSIDriver %s: %w", driver.Name, err))
+		}
+	}
+	return errs
+}
